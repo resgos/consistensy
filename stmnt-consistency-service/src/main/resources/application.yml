@@ -1,0 +1,47 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: stmnt-consistency-service
+  datasource:
+    url: ${PG_URL:jdbc:postgresql://localhost:5432/consistency}
+    username: ${PG_USER:consistency}
+    password: ${PG_PASSWORD:consistency}
+    hikari:
+      maximum-pool-size: 8
+      minimum-idle: 2
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    root: INFO
+    ru.sbrf.pprb.stmnt.consistency: INFO
+
+consistency:
+  cron: "0 5 * * * *"      # every hour at :05
+  snapshot-lag: PT5M       # 5 min
+  turn-lookback-days: 3
+  hash-retention-days: 30
+  clusters:
+    - id: cluster-1
+      addresses:
+        - ${CLUSTER1_HOST:ignite-1}:${CLUSTER1_PORT:10800}
+    - id: cluster-2
+      addresses:
+        - ${CLUSTER2_HOST:ignite-2}:${CLUSTER2_PORT:10800}
+    - id: cluster-3
+      addresses:
+        - ${CLUSTER3_HOST:ignite-3}:${CLUSTER3_PORT:10800}

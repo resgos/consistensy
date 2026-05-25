@@ -1,0 +1,90 @@
+version: "3.9"
+
+# Local verification stack:
+#   3 isolated single-node Ignite "clusters" (each one its own JVM/topology),
+#   Postgres for consistency-service state, the service itself.
+#
+# Smoke flow:
+#   docker compose up -d
+#   ./scripts/seed-clusters.sh        # populates 3 clusters with identical data
+#   curl -X POST localhost:8080/api/consistency/run   # → status OK, 0 mismatches
+#   ./scripts/inject-mismatch.sh      # diverges cluster-2 on one record
+#   curl -X POST localhost:8080/api/consistency/run   # → status MISMATCH
+#   curl 'localhost:8080/api/consistency/mismatches?unresolvedOnly=true'
+
+services:
+
+  ignite-1:
+    image: apacheignite/ignite:2.16.0
+    container_name: ignite-1
+    environment:
+      CONFIG_URI: /opt/ignite/apache-ignite/config/ignite.xml
+      IGNITE_QUIET: "false"
+    volumes:
+      - ./docker/ignite-config-template.xml:/opt/ignite/apache-ignite/config/ignite.xml:ro
+    ports:
+      - "10801:10800"
+
+  ignite-2:
+    image: apacheignite/ignite:2.16.0
+    container_name: ignite-2
+    environment:
+      CONFIG_URI: /opt/ignite/apache-ignite/config/ignite.xml
+      IGNITE_QUIET: "false"
+    volumes:
+      - ./docker/ignite-config-template.xml:/opt/ignite/apache-ignite/config/ignite.xml:ro
+    ports:
+      - "10802:10800"
+
+  ignite-3:
+    image: apacheignite/ignite:2.16.0
+    container_name: ignite-3
+    environment:
+      CONFIG_URI: /opt/ignite/apache-ignite/config/ignite.xml
+      IGNITE_QUIET: "false"
+    volumes:
+      - ./docker/ignite-config-template.xml:/opt/ignite/apache-ignite/config/ignite.xml:ro
+    ports:
+      - "10803:10800"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: consistency-pg
+    environment:
+      POSTGRES_DB: consistency
+      POSTGRES_USER: consistency
+      POSTGRES_PASSWORD: consistency
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U consistency"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  consistency-service:
+    build:
+      context: ./stmnt-consistency-service
+      dockerfile: Dockerfile
+    container_name: consistency-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ignite-1:
+        condition: service_started
+      ignite-2:
+        condition: service_started
+      ignite-3:
+        condition: service_started
+    environment:
+      PG_URL: jdbc:postgresql://postgres:5432/consistency
+      PG_USER: consistency
+      PG_PASSWORD: consistency
+      CLUSTER1_HOST: ignite-1
+      CLUSTER1_PORT: "10800"
+      CLUSTER2_HOST: ignite-2
+      CLUSTER2_PORT: "10800"
+      CLUSTER3_HOST: ignite-3
+      CLUSTER3_PORT: "10800"
+    ports:
+      - "8080:8080"
