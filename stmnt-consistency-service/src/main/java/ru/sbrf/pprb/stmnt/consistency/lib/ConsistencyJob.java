@@ -34,6 +34,7 @@ public class ConsistencyJob {
     private final ClusterReader reader;
     private final MismatchRepository repo;
     private final Hashers hashers;
+    private final ErrorRegistry errors;
 
     public static final String MISSING = "MISSING";
 
@@ -80,6 +81,9 @@ public class ConsistencyJob {
             log.error("Run {} failed", runId, e);
             status = "ERROR";
             error = e.getMessage();
+            errors.error("consistency_job", "RUN_FAILED",
+                    "Run " + runId + " failed", e,
+                    java.util.Map.of("runId", runId, "cache", String.valueOf(onlyCache)));
         } finally {
             repo.finishRun(runId, status, totalMismatches, error);
             log.info("Run {} done: status={} mismatches={}", runId, status, totalMismatches);
@@ -129,6 +133,14 @@ public class ConsistencyJob {
             }
         }
         repo.saveMismatches(runId, h.cacheName(), mismatches);
+        if (!mismatches.isEmpty()) {
+            errors.record("consistency_job", "WARN", "HASH_MISMATCH",
+                    "Detected " + mismatches.size() + " hash mismatches",
+                    java.util.Map.of("cache", h.cacheName(), "count", mismatches.size(),
+                            "examples", mismatches.stream().limit(3)
+                                    .map(MismatchRepository.Mismatch::businessKey).toList()),
+                    runId, null, h.cacheName());
+        }
         log.info("Run {} cache {} mismatches={}", runId, h.cacheName(), mismatches.size());
         return mismatches.size();
     }

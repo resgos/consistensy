@@ -23,6 +23,7 @@ import java.util.Map;
 public class ClusterReader {
 
     private final IgniteClientFactory clientFactory;
+    private final ErrorRegistry errors;
 
     /**
      * @return businessKey -> hashHex; empty if cluster unavailable.
@@ -32,6 +33,10 @@ public class ClusterReader {
         if (client == null) {
             log.warn("Cluster {} not connected, returning empty hash map for cache {}",
                     clusterId, hasher.cacheName());
+            errors.record("cluster_reader", "WARN", "CLUSTER_DOWN",
+                    "Cluster client not initialized",
+                    Map.of("cluster", clusterId, "cache", hasher.cacheName()),
+                    null, clusterId, hasher.cacheName());
             return Map.of();
         }
 
@@ -46,7 +51,17 @@ public class ClusterReader {
             if (!stripped.equals(sql)) {
                 log.debug("Cluster {} cache {}: fallback to PUBLIC schema",
                         clusterId, hasher.cacheName());
-                tryRunInto(client, stripped, hasher, hashes);
+                if (!tryRunInto(client, stripped, hasher, hashes)) {
+                    errors.record("cluster_reader", "ERROR", "QUERY_FAILED",
+                            "Both schema and PUBLIC fallback failed",
+                            Map.of("cluster", clusterId, "cache", hasher.cacheName(), "sql", sql),
+                            null, clusterId, hasher.cacheName());
+                }
+            } else {
+                errors.record("cluster_reader", "ERROR", "QUERY_FAILED",
+                        "SQL execution failed",
+                        Map.of("cluster", clusterId, "cache", hasher.cacheName(), "sql", sql),
+                        null, clusterId, hasher.cacheName());
             }
         }
         long ms = (System.nanoTime() - t0) / 1_000_000;

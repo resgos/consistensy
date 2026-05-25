@@ -30,6 +30,7 @@ public class AdminFanOut {
 
     private final IgniteClientFactory clientFactory;
     private final ConsistencyProperties props;
+    private final ErrorRegistry errors;
 
     private static final String SERVICE_NAME = "DayBalancesAdmin";
 
@@ -97,6 +98,10 @@ public class AdminFanOut {
     private Map<String, Object> invokeOne(String clusterId, String opName, AdminCall call) {
         IgniteClient client = clientFactory.get(clusterId);
         if (client == null) {
+            errors.record("admin_fanout", "WARN", "CLUSTER_DOWN",
+                    "Cluster client not initialized for admin op " + opName,
+                    Map.of("cluster", clusterId, "op", opName),
+                    null, clusterId, null);
             return Map.of("ok", false, "error", "cluster not connected");
         }
         try {
@@ -107,6 +112,9 @@ public class AdminFanOut {
             return Map.of("ok", true, "result", String.valueOf(res));
         } catch (Exception e) {
             log.error("Admin {} cluster={} failed: {}", opName, clusterId, e.toString(), e);
+            errors.error("admin_fanout", opName.toUpperCase() + "_FAILED",
+                    "Admin " + opName + " failed on cluster " + clusterId, e,
+                    Map.of("cluster", clusterId, "op", opName));
             return Map.of("ok", false, "error", e.toString());
         }
     }
