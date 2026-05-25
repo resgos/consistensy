@@ -41,6 +41,8 @@ Dropapp-сервис сверки данных между Ignite-кластер�
 
 ## REST API
 
+### Consistency (сверка)
+
 | | URL | Body / params | Назначение |
 |---|---|---|---|
 | `POST` | `/api/consistency/run` | `{"cacheName": "REGISTER"}` (опц.) | Запустить ad-hoc сверку; вернёт `{runId, status}` |
@@ -49,6 +51,40 @@ Dropapp-сервис сверки данных между Ignite-кластер�
 | `GET` | `/api/consistency/mismatches?cacheName=&since=&unresolvedOnly=true&limit=100` | `since` — ISO instant | Список расхождений |
 | `POST` | `/api/consistency/mismatches/{id}/resolve` | `{"notes": "fixed in ticket SBRF-12345"}` | Пометить разрешённым |
 | `GET` | `/actuator/health` | — | Health |
+
+### Admin fan-out на все кластера (init / cleanup / recalc)
+
+Эти endpoint'ы вызывают `DayBalancesAdminService` (cluster-singleton Ignite-service) **параллельно на каждом из 3 кластеров** через thin-client `serviceProxy`. Используется для batch-операций при инициализации или обслуживании стенда.
+
+| | URL | Body |
+|---|---|---|
+| `POST` | `/api/admin/init` | `{"registerId":"R001","fromDate":"2026-01-01","toDate":"2026-05-24","openingBalance":1000.00,"openingBalanceNat":null,"clusterIds":null}` |
+| `POST` | `/api/admin/cleanup` | `{"beforeDate":"2025-11-25","registerFilter":null,"clusterIds":null}` |
+| `POST` | `/api/admin/recalc` | `{"registerId":"R001","fromDate":"2026-05-20","toDate":"2026-05-24","clusterIds":null}` |
+
+`clusterIds: null` → fan-out на все кластера из конфига. `clusterIds: ["cluster-1"]` → только на указанные.
+
+**Init:**
+- Максимум **180 дней** (`MAX_INIT_DAYS`).
+- `openingBalance` (опц.) создаёт type50-якорь на `fromDate` с `EXPROP5='init'`. Якорь защищён от перезаписи штатным авто-пересчётом **и** от `cleanup`.
+- Диапазон обрабатывается батчами по 30 дней (`INIT_BATCH_DAYS`), без раздува памяти кластера.
+
+**Cleanup:**
+- Удаляет `DAY_BALANCES` и `TURN_DOC_CUR` `CCTYPEOPER=50` записи с `CCOPERATIONDAY < beforeDate`.
+- НЕ трогает type50 с `EXPROP5='init'` (init-якоря).
+- `registerFilter: null` → все регистры; non-null → только указанный.
+
+Пример ответа `/api/admin/init`:
+```json
+{
+  "operation": "init",
+  "perCluster": {
+    "cluster-1": {"ok": true, "result": "InitResult{register=R001 from=2026-01-01 to=2026-05-24 days=144 batches=5 ok=true}"},
+    "cluster-2": {"ok": true, "result": "InitResult{...}"},
+    "cluster-3": {"ok": false, "error": "cluster not connected"}
+  }
+}
+```
 
 ## Конфигурация (`application.yml`)
 
