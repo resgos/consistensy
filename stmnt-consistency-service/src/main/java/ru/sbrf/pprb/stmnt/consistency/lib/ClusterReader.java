@@ -36,25 +36,50 @@ public class ClusterReader {
         }
 
         Map<String, String> hashes = new HashMap<>();
-        SqlFieldsQuery q = new SqlFieldsQuery(hasher.selectSql())
+        long t0 = System.nanoTime();
+
+        // Try with hasher-specified schema first (production cache layout);
+        // fall back to PUBLIC if the schema doesn't exist (sql-DDL-created tables).
+        String sql = hasher.selectSql();
+        if (!tryRunInto(client, sql, hasher, hashes)) {
+            String stripped = stripSchemaPrefix(sql, hasher.cacheName());
+            if (!stripped.equals(sql)) {
+                log.debug("Cluster {} cache {}: fallback to PUBLIC schema",
+                        clusterId, hasher.cacheName());
+                tryRunInto(client, stripped, hasher, hashes);
+            }
+        }
+        long ms = (System.nanoTime() - t0) / 1_000_000;
+        log.info("Hashed cluster={} cache={} records={} timeMs={}",
+                clusterId, hasher.cacheName(), hashes.size(), ms);
+        return hashes;
+    }
+
+    /** @return true if query succeeded (even if 0 rows); false on exception. */
+    private boolean tryRunInto(IgniteClient client, String sql, HashCalculator hasher,
+                                Map<String, String> hashes) {
+        SqlFieldsQuery q = new SqlFieldsQuery(sql)
                 .setArgs(hasher.queryParams())
                 .setTimeout(60_000, java.util.concurrent.TimeUnit.MILLISECONDS);
-
-        long t0 = System.nanoTime();
         try (FieldsQueryCursor<List<?>> cursor = client.query(q)) {
             for (List<?> row : cursor) {
                 String bk = hasher.rowToBusinessKey(row);
                 if (bk == null) continue;
                 hashes.put(bk, hasher.rowToHash(row));
             }
+            return true;
         } catch (Exception e) {
-            log.error("computeHashes failed cluster={} cache={}: {}",
-                    clusterId, hasher.cacheName(), e.toString(), e);
-            return Map.of();
+            log.debug("query failed sql={}: {}", sql, e.toString());
+            return false;
         }
-        long ms = (System.nanoTime() - t0) / 1_000_000;
-        log.info("Hashed cluster={} cache={} records={} timeMs={}",
-                clusterId, hasher.cacheName(), hashes.size(), ms);
-        return hashes;
+    }
+
+    /**
+     * Strip "CACHE_NAME." prefixes from SQL so it can run against PUBLIC schema.
+     */
+    static String stripSchemaPrefix(String sql, String cacheName) {
+        return sql
+                .replaceAll("(?i)\\b" + java.util.regex.Pattern.quote(cacheName) + "\\.", "")
+                .replaceAll("(?i)\"" + java.util.regex.Pattern.quote(cacheName) + "\"\\.", "");
     }
 }

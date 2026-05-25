@@ -3,9 +3,9 @@
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <parent>
-        <groupId>sbp.com.sbt.dataspace</groupId>
-        <artifactId>dataspace-bom</artifactId>
-        <version>1.18.1-4</version>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.5</version>
         <relativePath/>
     </parent>
 
@@ -23,37 +23,12 @@
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+        <java.version>17</java.version>
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
         <ignite.version>2.16.0</ignite.version>
         <flyway.version>9.22.3</flyway.version>
         <postgresql.version>42.7.3</postgresql.version>
+        <testcontainers.version>1.19.7</testcontainers.version>
     </properties>
-
-    <distributionManagement>
-        <repository>
-            <id>release.repo</id>
-            <url>http://sbtnexus.delta.sbrf.ru:8081/nexus/content/repositories/SBT_CI_distr_repo/</url>
-        </repository>
-        <snapshotRepository>
-            <id>snapshot.repo</id>
-            <url>http://sbtnexus.delta.sbrf.ru:8081/nexus/content/repositories/SBT_CI_distr_repo/</url>
-        </snapshotRepository>
-    </distributionManagement>
-
-    <build>
-        <pluginManagement>
-            <plugins>
-                <plugin>
-                    <groupId>org.apache.maven.plugins</groupId>
-                    <artifactId>maven-compiler-plugin</artifactId>
-                    <configuration>
-                        <source>17</source>
-                        <target>17</target>
-                        <fork>false</fork>
-                    </configuration>
-                </plugin>
-            </plugins>
-        </pluginManagement>
-    </build>
 </project>

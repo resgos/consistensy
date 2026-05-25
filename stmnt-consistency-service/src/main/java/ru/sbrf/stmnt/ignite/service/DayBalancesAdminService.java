@@ -58,6 +58,12 @@ public interface DayBalancesAdminService extends Service {
     void recalcRegisterRange(String registerId, String fromDateIso, String toDateIso);
 
     /**
+     * Trigger one pass of daily cleanup right now (instead of waiting for 04:00 cron).
+     * Operation is no-op unless system property daybalances.cleanup.retention-days > 0.
+     */
+    void dailyCleanupNow();
+
+    /**
      * Serializable DTOs — must not reference Ignite-server-only classes, so
      * we keep them inside the interface for thin-client compatibility.
      */

@@ -1,6 +1,7 @@
 package ru.sbrf.pprb.stmnt.consistency.lib.hash;
 
 import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
 import ru.sbrf.pprb.stmnt.consistency.config.ConsistencyProperties;
 
 import java.time.LocalDate;
@@ -20,6 +21,7 @@ import static ru.sbrf.pprb.stmnt.consistency.lib.hash.HashUtil.md5Of;
  * EnrichDirectory is intentionally NOT implemented — per the spec it requires
  * a RQUID/version field to be added to the DTO first.
  */
+@Component
 @RequiredArgsConstructor
 public final class Hashers {
 
