@@ -1,26 +1,50 @@
-# Аналитика SQL-планов
+# Аналитика SQL-планов (после ANALYZE)
 
 **Версия Ignite**: **Apache Ignite 2.16.0** — upstream-база, поверх которой собран **Platform V Datagrid 17.6.3**.
-**Подтверждение в стенде**: `ignite-core-2.16.0.jar` в каждом контейнере (`apacheignite/ignite:2.16.0`).
+**Подтверждение в стенде**: `ignite-core-2.16.0.jar` в каждом контейнере (`apacheignite/ignite:2.16.0`), `ignite-calcite-2.16.0.jar` подключен через `OPTION_LIBS`.
 
 Тестовый стенд:
 - 3 single-node кластера (`cluster-1`, `cluster-2`, `cluster-3`).
 - Таблицы созданы через SQL-DDL: REGISTER, TURN_DOC_CUR, DAY_BALANCES, CLIENT, CURRENCY, CB_RATE, DIVISION, INCOME_SALDO, CASH_SYMBOL_DOC, TURN_DOC_CUR_REESTR.
 - Индексы (явные): `IDX_TDC_REG_OP (REGISTER, CCOPERATIONDAY)`, `IDX_TDC_REG_TYPE_OP (REGISTER, CCTYPEOPER, CCOPERATIONDAY)`.
+- Два SQL-движка: **H2** (default) + **Calcite** (для запросов с `/*+ QUERY_ENGINE('calcite') */`).
 
-Способ снятия: `GET /api/debug/explain-all?clusterId=cluster-1`. Полный JSON-сnapshot не зафиксирован в репо (генерируется по требованию).
+## Подготовка
+
+```bash
+# 1. seed данные
+curl -X POST http://localhost:8080/api/debug/seed -H 'Content-Type: application/json' -d '{}'
+
+# 2. ANALYZE — сбор статистики для cost-based планировщика
+curl -X POST 'http://localhost:8080/api/debug/analyze-all?clusterId=cluster-1'
+# → { "tables": { "REGISTER":"analyzed", ..., "CLIENT":"reserved-word error" } }
+
+# 3. dump планов
+curl 'http://localhost:8080/api/debug/explain-all?clusterId=cluster-1' > plans.json
+```
+
+**Состав инвентаризации** — 39 запросов:
 
 ---
 
 ## Сводка
 
-| Категория | Количество | Index Scan (H2) | Full Scan (H2) | IndexScan + searchBounds (Calcite) |
-|---|---:|---:|---:|---:|
-| Hasher reads | 9 | 0 | 9 | 0 |
-| DayBalancesRecalcService selects | 14 | 7 | 5 | **2** |
-| **Всего** | **23** | **7** | **14** | **2** |
+| Категория | Запросов | План получен | План не получен | Причина отказа |
+|---|---:|---:|---:|---|
+| Hasher reads | 9 | 9 | 0 | — |
+| DayBalancesRecalcService SELECT | 18 | 15 | 3 | колонки CCDAYBALANCESBEGINDATE / CCREESTRRECALCDATE отсутствуют в smoke DDL |
+| DayBalancesRecalcService DML (DELETE/UPDATE) | 9 | 0 | 9 | H2: `Explains of update queries are not supported` |
+| SYS-views (affinity) | 3 | 3 | 0 | — |
+| **Всего** | **39** | **27** | **12** | |
 
-Calcite engine подключён в smoke-стенде (`OPTION_LIBS=ignite-calcite` + `SqlConfiguration` с обоими движками). Hint `/*+ QUERY_ENGINE('calcite') */` маршрутизирует SQL на нужный движок.
+По движкам:
+
+| Движок | План получен |
+|---|---:|
+| H2 (default) | 25 |
+| Calcite (`/*+ QUERY_ENGINE('calcite') */`) | 2 |
+
+ANALYZE отработал на 9 из 10 таблиц. `CLIENT` — зарезервированное слово в H2, требует кавычек (`"CLIENT"`) — не критично для текущих запросов.
 
 Распределение по характеру плана соответствует ожиданиям:
 - Все Hasher-выборки — полные снимки кешей (нужна вся таблица), `__SCAN_` оптимален.
@@ -159,6 +183,36 @@ IgniteProject(EXPR$0=[CASE(>(...) ...)])         ← GREATEST(MAX_0, MAX_40)
         IgniteIndexScan(... =CCTYPEOPER=40, <2026-05-24, same searchBounds ...)
 ```
 Ключевое: **`searchBounds`** на `(REGISTER, CCOPERATIONDAY)` ограничивают index scan диапазоном `REGISTER='R001' AND CCOPERATIONDAY < 2026-05-24` — Calcite читает только релевантные индексные записи, без full scan. На H2 этот же запрос потребовал бы FullScan + Sort + Aggregate.
+
+#### `SQL_REESTR_CALCULATE` (Calcite, самый сложный JOIN)
+
+Подзапрос с `MIN(CCTRANSACTIONID)` + JOIN с TURNDOCCURREESTR через `LIKE` для prefix-матча `CCIDEKS`:
+
+```
+IgniteColocatedHashAggregate(group=[{0..5}], TURNCOUNT=COUNT(), REESTRSUM=SUM, REESTRSUMNAT=SUM)
+  IgniteProject(CCREESTRID, TURNID, IDEKS, TURNSUM, TURNSUMNAT, TURNSUMPO, CCSUM, CCSUMNAT)
+    IgniteNestedLoopJoin(condition=[AND(=, =, OR(=, LIKE($t27, ||($3, '\_%'), '\\'))], joinType=[inner])
+      IgniteProject(t1.*)                                                        ← основная таблица t
+        IgniteNestedLoopJoin(condition=[AND(=$3=$24, =$15=$25, =$5=$26, IS NOT DISTINCT FROM($17,$27))], inner)
+          IgniteExchange(distribution=[single])                                   ← t1 (TURNDOCCUR)
+            IgniteIndexScan(table=PUBLIC.TURNDOCCUR, index=IDX_TDC_REG_TYPE_OP_proxy,
+                            searchBounds=[ExactBounds[R001], MultiBounds[0|40], ExactBounds[2026-05-24]])
+          IgniteColocatedHashAggregate(group=[{0,1,2}], MIN_TID=MIN($3))         ← subquery MIN(CCTRANSACTIONID)
+            IgniteExchange(distribution=[single])
+              IgniteIndexScan(table=PUBLIC.TURNDOCCUR, index=IDX_TDC_REG_TYPE_OP_proxy,
+                              searchBounds=[ExactBounds[R001], MultiBounds[0|40], ExactBounds[2026-05-24]])
+      IgniteExchange(distribution=[single])                                       ← TURNDOCCURREESTR r
+        IgniteIndexScan(table=PUBLIC.TURNDOCCURREESTR, index=_key_PK)             ← full PK scan
+```
+
+**Хорошо:**
+- Внутренний JOIN использует индекс `IDX_TDC_REG_TYPE_OP_proxy` для t1 с MultiBounds на CCTYPEOPER (точечно фильтрует на 0 и 40).
+- Подзапрос с MIN(CCTRANSACTIONID) пробивает тот же индекс с теми же bounds.
+- Aggregate финальный — `Colocated` (Calcite понимает что данные уже сгруппированы по нужным колонкам).
+
+**Тонкое место:**
+- TURNDOCCURREESTR обходится через `_key_PK` (full PK scan). При больших объёмах reestr-данных в проде nested-loop с этой таблицей может быть тяжёлым. На реальном кластере с **общей `cache_group`** для TURN_DOC_CUR и TURN_DOC_CUR_REESTR (что есть в `cache-config.xml` `stmnt-ignite_precalc`) Calcite сможет применить **collocated join** — без shuffle. В smoke этого не видно (cache_group разные, single-node).
+- `LIKE($t27, ||($3, '\_%'))` — функциональное сравнение, индекс на REESTR.CCIDEKS не используется.
 
 #### `SQL_TYPE50_START_BEFORE` (Calcite)
 

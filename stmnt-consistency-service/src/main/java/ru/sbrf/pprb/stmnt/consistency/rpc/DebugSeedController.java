@@ -278,6 +278,36 @@ public class DebugSeedController {
     }
 
     /**
+     * Triggers `ANALYZE schema.table` for each known table. After analyze, the
+     * planner has fresh row counts / NDV / distribution → better cost-based plans.
+     *
+     * Idempotent. Ignite Calcite & H2 both consume the same statistics.
+     */
+    @PostMapping("/analyze-all")
+    public Map<String, Object> analyzeAll(@RequestParam(defaultValue = "cluster-1") String clusterId) {
+        IgniteClient client = clientFactory.get(clusterId);
+        if (client == null) return Map.of("error", "cluster not connected: " + clusterId);
+
+        // Tables present in smoke seed
+        java.util.List<String> tables = java.util.List.of(
+                "REGISTER", "CURRENCY", "DAYBALANCES", "CLIENT", "CBRATE",
+                "TURNDOCCUR", "DIVISION", "INCOMESALDO", "CASHSYMBOLDOC", "TURNDOCCURREESTR"
+        );
+        Map<String, Object> result = new java.util.LinkedHashMap<>();
+        for (String t : tables) {
+            try {
+                try (var cur = client.query(new SqlFieldsQuery("ANALYZE PUBLIC." + t))) {
+                    cur.getAll();
+                }
+                result.put(t, "analyzed");
+            } catch (Exception e) {
+                result.put(t, "error: " + e.getMessage());
+            }
+        }
+        return Map.of("clusterId", clusterId, "tables", result);
+    }
+
+    /**
      * Dump EXPLAIN plans for ALL known SQL queries — hasher reads + Ignite-side
      * DayBalancesRecalcService SQL. Used as one-shot diagnostic before tuning.
      *
@@ -373,6 +403,78 @@ public class DebugSeedController {
                 "SELECT DISTINCT REGISTER FROM TURNDOCCUR WHERE CCTYPEOPER=50");
         queries.put("daybalances.pruneOldType50_max",
                 "SELECT MAX(CCOPERATIONDAY) FROM TURNDOCCUR WHERE REGISTER='R001' AND CCTYPEOPER=50");
+
+        // ===== Дополнительные SQL, ранее не охваченные =====
+
+        queries.put("daybalances.SQL_REGISTERS_NULL_RECALC",
+                "SELECT R.OBJECTID, R.CCOPENDATE, R.CCREESTRRECALCDATE FROM REGISTER R " +
+                        "WHERE R.CCBALANCERECALCDATE IS NULL AND R.CCOPENDATE >= '2000-01-01' " +
+                        "AND R.CCOPENDATE <= DATE '2026-05-26' " +
+                        "AND (R.CCCLOSEDATE IS NULL OR R.CCCLOSEDATE >= DATE '2026-04-26')");
+
+        // SQL_REESTR_CALCULATE — самый сложный JOIN с подзапросом MIN(CCTRANSACTIONID)
+        queries.put("daybalances.SQL_REESTR_CALCULATE",
+                "SELECT /*+ QUERY_ENGINE('calcite') */ " +
+                        " r.CCREESTRID, t.OBJECTID AS TURNID, t.CCIDEKS AS IDEKS, " +
+                        " t.CCSUM AS TURNSUM, t.CCSUMNAT AS TURNSUMNAT, t.CCSUMPO AS TURNSUMPO, " +
+                        " COUNT(r.CCSUM) AS TURNCOUNT, SUM(r.CCSUM) AS REESTRSUM, SUM(r.CCSUMNAT) AS REESTRSUMNAT " +
+                        "FROM (" +
+                        " SELECT t1.* FROM TURNDOCCUR t1 INNER JOIN (" +
+                        "  SELECT REGISTER, CCOPERATIONDAY, CCIDEKS, MIN(CCTRANSACTIONID) AS MIN_TID " +
+                        "  FROM TURNDOCCUR " +
+                        "  WHERE REGISTER='R001' AND CCOPERATIONDAY=DATE '2026-05-24' AND CCTYPEOPER IN (0,40) " +
+                        "  GROUP BY REGISTER, CCOPERATIONDAY, CCIDEKS" +
+                        " ) m ON t1.REGISTER = m.REGISTER AND t1.CCOPERATIONDAY = m.CCOPERATIONDAY " +
+                        "    AND t1.CCIDEKS = m.CCIDEKS " +
+                        "    AND (t1.CCTRANSACTIONID = m.MIN_TID OR (t1.CCTRANSACTIONID IS NULL AND m.MIN_TID IS NULL))" +
+                        ") t INNER JOIN TURNDOCCURREESTR r " +
+                        " ON r.REGISTER=t.REGISTER AND r.CCOPERATIONDAY=t.CCOPERATIONDAY " +
+                        " AND (r.CCIDEKS=t.CCIDEKS OR r.CCIDEKS LIKE t.CCIDEKS || '\\_%' ESCAPE '\\') " +
+                        "WHERE t.REGISTER='R001' AND t.CCOPERATIONDAY=CAST(DATE '2026-05-24' AS DATE) " +
+                        " AND t.CCTYPEOPER IN (0,40) " +
+                        "GROUP BY r.CCREESTRID, t.OBJECTID, t.CCIDEKS, t.CCSUM, t.CCSUMNAT, t.CCSUMPO");
+
+        // DELETE / UPDATE планы — тоже валидны для EXPLAIN
+        queries.put("daybalances.SQL_CLEANUP_DAY_BALANCES",
+                "DELETE FROM DAYBALANCES WHERE CCOPERATIONDAY<DATE '2026-02-25' " +
+                        "AND (REGISTER='R001' OR 'R001' IS NULL)");
+        queries.put("daybalances.SQL_CLEANUP_TYPE50",
+                "DELETE FROM TURNDOCCUR WHERE CCTYPEOPER=50 AND CCOPERATIONDAY<DATE '2026-02-25' " +
+                        "AND (EXPROP5 IS NULL OR EXPROP5<>'init') " +
+                        "AND (REGISTER='R001' OR 'R001' IS NULL)");
+        queries.put("daybalances.deleteOneDay.TDC",
+                "DELETE FROM TURNDOCCUR WHERE REGISTER='R001' AND CCOPERATIONDAY=DATE '2026-02-24'");
+        queries.put("daybalances.deleteOneDay.TDCR",
+                "DELETE FROM TURNDOCCURREESTR WHERE REGISTER='R001' AND CCOPERATIONDAY=DATE '2026-02-24'");
+        queries.put("daybalances.pruneOldType50_delete",
+                "DELETE FROM TURNDOCCUR WHERE REGISTER='R001' AND CCTYPEOPER=50 " +
+                        "AND CCOPERATIONDAY<DATE '2026-05-24'");
+        queries.put("daybalances.upsertInitAnchor.delete_nonInit",
+                "DELETE FROM TURNDOCCUR WHERE REGISTER='R001' AND CCTYPEOPER=50 " +
+                        "AND CCOPERATIONDAY=DATE '2026-05-22'");
+        queries.put("daybalances.findRegistersWithActivityOnDay.DayBalances",
+                "SELECT DISTINCT REGISTER FROM DAYBALANCES WHERE CCOPERATIONDAY=DATE '2026-05-24'");
+        queries.put("daybalances.updateTurnSums",
+                "UPDATE TURNDOCCUR SET CCSUM=100.00, CCSUMNAT=100.00, CCRQTM=TIMESTAMP '2026-05-26 00:00:00' " +
+                        "WHERE OBJECTID='R001:T22D'");
+        queries.put("daybalances.updateTurnSumPo",
+                "UPDATE TURNDOCCUR SET CCSUMPO=100.00, CCRQTM=TIMESTAMP '2026-05-26 00:00:00' " +
+                        "WHERE OBJECTID='R001:T22D'");
+        queries.put("daybalances.updateTurnModifyTime",
+                "UPDATE TURNDOCCUR SET LASTMODIFYTIME=TIMESTAMP '2026-05-26 00:00:00', EXPROP2='U' " +
+                        "WHERE OBJECTID='R001:T22D'");
+        queries.put("daybalances.clearReestrRecalcDate",
+                "UPDATE REGISTER SET CCREESTRRECALCDATE=NULL WHERE OBJECTID='R001'");
+
+        // Affinity probe (используется в /api/debug/affinity)
+        queries.put("affinity.SYS_NODES",
+                "SELECT NODE_ID, IS_CLIENT, NODE_ORDER FROM SYS.NODES");
+        queries.put("affinity.SYS_CACHES",
+                "SELECT CACHE_NAME, CACHE_GROUP_NAME, BACKUPS, CACHE_MODE, AFFINITY " +
+                        "FROM SYS.CACHES " +
+                        "WHERE CACHE_NAME IN ('REGISTER','TURN_DOC_CUR','DAY_BALANCES','CURRENCY','CB_RATE','CLIENT')");
+        queries.put("affinity.SYS_CACHE_GROUPS",
+                "SELECT CACHE_GROUP_NAME, PARTITIONS_COUNT, DATA_REGION_NAME FROM SYS.CACHE_GROUPS");
 
         Map<String, Object> plans = new java.util.LinkedHashMap<>();
         for (var e : queries.entrySet()) {
