@@ -42,6 +42,13 @@ public class ConsistencyProperties {
     /** Hash retention in days. */
     private int hashRetentionDays = 30;
 
+    /**
+     * Debug switch: when true, ClusterReader runs EXPLAIN before each hasher SQL and
+     * logs the plan. Useful for verifying that index scans / reverse scans / co-located
+     * joins are picked. Disable in production — adds extra round-trip per query.
+     */
+    private boolean debugExplainPlans = false;
+
     @Data
     public static class Cluster {
         /** Logical id, e.g. "cluster-1". */

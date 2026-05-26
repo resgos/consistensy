@@ -12,6 +12,7 @@ import ru.sbrf.pprb.stmnt.consistency.lib.ErrorRegistry;
 import java.math.BigDecimal;
 import java.sql.Date;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -84,6 +85,186 @@ public class DebugSeedController {
             }
         }
         return Map.of("scenario", name, "perCluster", result);
+    }
+
+    /**
+     * Manual EXPLAIN — useful for ad-hoc inspection of query plans on each cluster.
+     * Body: { "sql": "...", "clusterId": "cluster-1" (optional → all) }
+     */
+    @PostMapping("/explain")
+    public Map<String, Object> explain(@RequestBody Map<String, Object> body) {
+        String sql = (String) body.get("sql");
+        String only = (String) body.get("clusterId");
+        if (sql == null || sql.isBlank()) {
+            return Map.of("error", "missing 'sql' field");
+        }
+        Map<String, Object> result = new HashMap<>();
+        for (var c : props.getClusters()) {
+            if (only != null && !only.equals(c.getId())) continue;
+            IgniteClient client = clientFactory.get(c.getId());
+            if (client == null) {
+                result.put(c.getId(), "not connected");
+                continue;
+            }
+            try (var cursor = client.query(new SqlFieldsQuery("EXPLAIN " + sql))) {
+                java.util.List<String> lines = new java.util.ArrayList<>();
+                for (List<?> row : cursor) lines.add(String.valueOf(row.get(0)));
+                result.put(c.getId(), lines);
+            } catch (Exception e) {
+                result.put(c.getId(), "error: " + e);
+            }
+        }
+        return Map.of("sql", sql, "plans", result);
+    }
+
+    /**
+     * Affinity probe — для каждого кластера:
+     *   - server-side информация: число живых server-узлов, версия Ignite
+     *   - cache layout: какие кеши есть, какой affinity-mapping (через системные view'ы)
+     *   - co-location check: для каждого register из REGISTER считаем partition в
+     *     REGISTER / TURN_DOC_CUR / DAY_BALANCES; ожидаем одинаковый partition
+     *     внутри одного кластера (за счёт @AffinityKeyMapped register).
+     *
+     * В docker-compose стенде каждый кластер single-node, поэтому partition внутри
+     * кластера всегда тот же узел. Полезность фичи — в реальной multi-node инсталляции.
+     */
+    @GetMapping("/affinity")
+    public Map<String, Object> affinity() {
+        Map<String, Object> result = new LinkedHashMap<>();
+        for (var c : props.getClusters()) {
+            IgniteClient client = clientFactory.get(c.getId());
+            if (client == null) {
+                result.put(c.getId(), Map.of("ok", false, "error", "not connected"));
+                continue;
+            }
+            Map<String, Object> per = new LinkedHashMap<>();
+            try {
+                // 1. cluster size / nodes
+                int nodes = client.cluster().nodes().size();
+                per.put("server_nodes", nodes);
+
+                // 2. cache list (filter PUBLIC-style — наши таблицы)
+                var caches = client.cacheNames();
+                per.put("caches", caches);
+
+                // 3. SYS.NODES — server endpoints (thin client compatible)
+                java.util.List<Map<String, Object>> nodeRows = new java.util.ArrayList<>();
+                try (var cur = client.query(new SqlFieldsQuery(
+                        "SELECT NODE_ID, IS_CLIENT, NODE_ORDER FROM SYS.NODES"))) {
+                    for (List<?> row : cur) {
+                        nodeRows.add(Map.of(
+                                "node_id",     String.valueOf(row.get(0)),
+                                "is_client",   row.get(1),
+                                "node_order",  row.get(2)));
+                    }
+                }
+                per.put("sys_nodes", nodeRows);
+
+                // 4. CACHES — backups / mode / affinity (Ignite 2.16 SYS view).
+                // Ignite 2.16 SYS.CACHES не имеет AFFINITY_KEY_TYPE; используем AFFINITY
+                // (текстовое представление AffinityFunction) и CACHE_GROUP_NAME.
+                java.util.List<Map<String, Object>> cacheRows = new java.util.ArrayList<>();
+                try (var cur = client.query(new SqlFieldsQuery(
+                        "SELECT CACHE_NAME, CACHE_GROUP_NAME, BACKUPS, CACHE_MODE, AFFINITY " +
+                                "FROM SYS.CACHES " +
+                                "WHERE CACHE_NAME IN ('REGISTER','TURN_DOC_CUR','DAY_BALANCES'," +
+                                "                    'CURRENCY','CB_RATE','CLIENT')"))) {
+                    for (List<?> row : cur) {
+                        cacheRows.add(Map.of(
+                                "cache_name",     String.valueOf(row.get(0)),
+                                "cache_group",    String.valueOf(row.get(1)),
+                                "backups",        row.get(2),
+                                "cache_mode",     String.valueOf(row.get(3)),
+                                "affinity_func",  String.valueOf(row.get(4))));
+                    }
+                }
+                per.put("sys_caches", cacheRows);
+
+                // 4b. CACHE_GROUPS — реальное число партиций и режим (PARTITIONS живёт здесь)
+                java.util.List<Map<String, Object>> groupRows = new java.util.ArrayList<>();
+                try (var cur = client.query(new SqlFieldsQuery(
+                        "SELECT CACHE_GROUP_NAME, PARTITIONS_COUNT, DATA_REGION_NAME " +
+                                "FROM SYS.CACHE_GROUPS"))) {
+                    for (List<?> row : cur) {
+                        String gn = String.valueOf(row.get(0));
+                        if ("ignite-sys-cache".equals(gn) || "default".equals(gn)) continue;
+                        groupRows.add(Map.of(
+                                "cache_group",      gn,
+                                "partitions",       row.get(1),
+                                "data_region",      String.valueOf(row.get(2))));
+                    }
+                }
+                per.put("sys_cache_groups", groupRows);
+
+                // 5. co-location probe: для всех REGISTER считаем partition по каждому кешу
+                //    (через CACHE() helper)
+                java.util.List<Map<String, Object>> colocate = new java.util.ArrayList<>();
+                try (var cur = client.query(new SqlFieldsQuery(
+                        "SELECT OBJECTID FROM REGISTER LIMIT 5"))) {
+                    for (List<?> row : cur) {
+                        String reg = String.valueOf(row.get(0));
+                        Integer pReg     = partitionOf(client, "REGISTER",      reg);
+                        Integer pTurn    = partitionOf(client, "TURN_DOC_CUR",  reg);
+                        Integer pDayB    = partitionOf(client, "DAY_BALANCES", reg);
+                        boolean ok = (pReg != null && pReg.equals(pTurn) && pReg.equals(pDayB));
+                        colocate.add(Map.of(
+                                "register",         reg,
+                                "REGISTER_part",    String.valueOf(pReg),
+                                "TURN_DOC_CUR_part", String.valueOf(pTurn),
+                                "DAY_BALANCES_part", String.valueOf(pDayB),
+                                "collocated_ok",    ok));
+                    }
+                }
+                per.put("colocation_by_partition", colocate);
+
+                // 5b. Колокация через cache_group — критерий для true colocated-joins.
+                // Если два кеша в одной cache_group + используют одинаковый affinity-mapping,
+                // INNER JOIN по REGISTER можно делать collocated (без cross-partition shuffle).
+                Map<String, Object> groupOf = new LinkedHashMap<>();
+                for (Map<String, Object> r : cacheRows) {
+                    groupOf.put((String) r.get("cache_name"), r.get("cache_group"));
+                }
+                boolean sameGroup =
+                        groupOf.get("REGISTER") != null
+                                && groupOf.get("REGISTER").equals(groupOf.get("TURN_DOC_CUR"))
+                                && groupOf.get("REGISTER").equals(groupOf.get("DAY_BALANCES"));
+                per.put("colocation_by_cache_group_ok", sameGroup);
+                per.put("note", sameGroup
+                        ? "REGISTER/TURN_DOC_CUR/DAY_BALANCES share one cache_group — collocated JOINs work."
+                        : "Each cache has its own cache_group (SQL-DDL default). For production set " +
+                          "single cache_group OR same affinity_key on all caches.");
+                per.put("ok", true);
+            } catch (Exception e) {
+                per.put("ok", false);
+                per.put("error", e.toString());
+            }
+            result.put(c.getId(), per);
+        }
+        return result;
+    }
+
+    /**
+     * Partition number for an affinity key using Ignite SYS.CACHE_GROUPS (Ignite 2.16
+     * does not expose PARTITIONS on SYS.CACHES, only on SYS.CACHE_GROUPS).
+     *
+     * NOTE: this is a CRUDE approximation — real RendezvousAffinityFunction is not
+     * a simple hashCode%N. For demonstration only. For single-node clusters it
+     * doesn't matter (everything is on one node anyway).
+     */
+    private Integer partitionOf(IgniteClient client, String cacheName, String affKey) {
+        try (var cur = client.query(new SqlFieldsQuery(
+                "SELECT cg.PARTITIONS_COUNT FROM SYS.CACHES c " +
+                        " JOIN SYS.CACHE_GROUPS cg ON c.CACHE_GROUP_NAME = cg.CACHE_GROUP_NAME " +
+                        " WHERE c.CACHE_NAME = ?").setArgs(cacheName))) {
+            for (List<?> row : cur) {
+                Object v = row.get(0);
+                if (v == null) continue;
+                int parts = ((Number) v).intValue();
+                // affKey.hashCode() — НЕ настоящий RendezvousAffinityFunction; для приближения хватит.
+                return Math.floorMod(affKey.hashCode(), parts);
+            }
+        } catch (Exception ignored) {}
+        return null;
     }
 
     @PostMapping("/reset")

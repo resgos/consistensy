@@ -35,6 +35,7 @@ consistency:
   snapshot-lag: PT5M       # 5 min
   turn-lookback-days: 3
   hash-retention-days: 30
+  debug-explain-plans: ${CONSISTENCY_DEBUG_EXPLAIN:false}
   clusters:
     - id: cluster-1
       addresses:

@@ -86,5 +86,6 @@ services:
       CLUSTER2_PORT: "10800"
       CLUSTER3_HOST: ignite-3
       CLUSTER3_PORT: "10800"
+      CONSISTENCY_DEBUG_EXPLAIN: "true"
     ports:
       - "8080:8080"

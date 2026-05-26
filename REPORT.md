@@ -437,6 +437,92 @@ $ curl http://localhost:8080/api/errors/stats
 | `POST` | `/api/debug/seed` | Identical seed во все 3 (опц. `{divergeCluster}`) |
 | `POST` | `/api/debug/scenario/{name}` | Один из 8 named-сценариев (см. выше) |
 | `POST` | `/api/debug/reset` | DELETE всех таблиц на всех кластерах |
+| `POST` | `/api/debug/explain` | EXPLAIN произвольного SQL на каждом кластере, `{sql, clusterId?}` |
+| `GET`  | `/api/debug/affinity` | Топология + cache-group / affinity-функция + co-location probe |
+
+---
+
+## Debug-логирование планов
+
+Включается флагом `consistency.debug.explain-plans=true` (в смоук-стенде — через ENV `CONSISTENCY_DEBUG_EXPLAIN=true` в `docker-compose.yml`).
+
+Когда включено — `ClusterReader` перед каждым hasher-запросом запускает `EXPLAIN <same sql>` с теми же параметрами и пишет план в `log.info`:
+
+```
+EXPLAIN cache=REGISTER sql='SELECT OBJECTID, CCRQTM, CCOPENDATE, ... FROM REGISTER' plan:
+  SELECT __Z0.OBJECTID AS __C0_0, ... FROM PUBLIC.REGISTER __Z0  /* PUBLIC.REGISTER.__SCAN_ */
+  SELECT __C0_0 AS OBJECTID, ... FROM PUBLIC.__T0                /* PUBLIC."merge_scan" */
+```
+
+Двухфазный план (типичный для Ignite SQL):
+- **Map phase** — выполняется на каждом узле, имеющем партиции кеша. Здесь видно `__SCAN_` (full scan) или `_IDX_` (индексный доступ).
+- **Reduce phase** — `merge_scan` на координаторе.
+
+Для ручной проверки конкретного SQL без перезапуска сервиса:
+
+```bash
+curl -X POST http://localhost:8080/api/debug/explain \
+     -H 'Content-Type: application/json' \
+     -d '{"sql":"SELECT * FROM REGISTER WHERE OBJECTID=?", "clusterId":"cluster-1"}'
+```
+
+В реальном production `stmnt-ignite_precalc` с `cache-config.xml` индексы определены через `QueryEntity.indexes` → в плане появится `_IDX_REGISTER_CCOPENDATE` / `INDEX RANGE_SCAN` / `INDEX REVERSE_SCAN` (последнее — для `ORDER BY ... DESC LIMIT 1` с Calcite-хинтом).
+
+---
+
+## Affinity / co-location
+
+Endpoint `GET /api/debug/affinity` собирает:
+
+- `server_nodes` — число живых server-узлов на кластере
+- `sys_nodes` — выгрузка `SYS.NODES`
+- `sys_caches` — для каждого кеша: `cache_group`, `cache_mode`, `backups`, `affinity_func` (toString от `AffinityFunction`)
+- `sys_cache_groups` — `partitions_count` и `data_region` для каждой группы
+- `colocation_by_partition` — для нескольких реальных register'ов считает приближённый partition (`hashCode % parts`) в REGISTER / TURN_DOC_CUR / DAY_BALANCES и сравнивает.
+- `colocation_by_cache_group_ok` — **true** если REGISTER/TURN_DOC_CUR/DAY_BALANCES в одной `cache_group` (условие настоящего collocated-JOIN без cross-partition shuffle).
+
+В smoke-стенде:
+```json
+{
+  "cluster-1": {
+    "server_nodes": 1,
+    "sys_caches": [
+      {"cache_name":"REGISTER",     "cache_group":"REGISTER",     "affinity_func":"RendezvousAffinityFunction [parts=1024, ...]", ...},
+      {"cache_name":"DAY_BALANCES", "cache_group":"DAY_BALANCES", "affinity_func":"RendezvousAffinityFunction [parts=1024, ...]", ...},
+      ...
+    ],
+    "sys_cache_groups": [
+      {"cache_group":"REGISTER",     "partitions":1024},
+      {"cache_group":"DAY_BALANCES", "partitions":1024},
+      ...
+    ],
+    "colocation_by_partition": [
+      {"register":"R001", "REGISTER_part":"159", "DAY_BALANCES_part":"159", "collocated_ok":false},
+      {"register":"R002", "REGISTER_part":"160", "DAY_BALANCES_part":"160", "collocated_ok":false},
+      ...
+    ],
+    "colocation_by_cache_group_ok": false,
+    "note": "Each cache has its own cache_group (SQL-DDL default). For production set single cache_group OR same affinity_key on all caches."
+  }
+}
+```
+
+**Что видно**: одни и те же `parts=159` для R001 в REGISTER и DAY_BALANCES — но в **разных** cache_group'ах. Это значит:
+- В **single-node** стенде физически JOIN работает без shuffle (всё на одном узле).
+- В **multi-node** проде с SQL-DDL-default-layout каждый JOIN R + DAYBALANCES требовал бы **cross-partition exchange** даже при одинаковом register'е.
+
+Для production правильно:
+- В `cache-config.xml` явно указывать **общую `groupName`** для всех связанных кешей (как в `stmnt-ignite_precalc`), либо
+- Использовать `@AffinityKeyMapped` на одинаковом поле во всех `*AffinityKey` (что уже сделано через `TurnDocCurAffinityKey.register`, `DayBalancesAffinityKey.register` и т.д.).
+
+В `stmnt-ignite_precalc` оба условия выполнены — `verifyCollocation()` на старте проверяет:
+```java
+int pReg = ignite.affinity("REGISTER").partition(new RegisterObjectId(probe));
+int pTdc = ignite.affinity("TURN_DOC_CUR").partition(
+        TurnDocCurAffinityKey.builder().register(probe).objectId("x").build());
+if (pReg != pTdc)
+    throw new IllegalStateException("COLLOCATION MISMATCH ...");
+```
 
 ---
 

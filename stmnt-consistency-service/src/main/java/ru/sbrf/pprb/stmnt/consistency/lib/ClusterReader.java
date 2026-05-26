@@ -6,6 +6,7 @@ import org.apache.ignite.cache.query.FieldsQueryCursor;
 import org.apache.ignite.cache.query.SqlFieldsQuery;
 import org.apache.ignite.client.IgniteClient;
 import org.springframework.stereotype.Component;
+import ru.sbrf.pprb.stmnt.consistency.config.ConsistencyProperties;
 import ru.sbrf.pprb.stmnt.consistency.integration.ignite.IgniteClientFactory;
 import ru.sbrf.pprb.stmnt.consistency.lib.hash.HashCalculator;
 
@@ -24,6 +25,7 @@ public class ClusterReader {
 
     private final IgniteClientFactory clientFactory;
     private final ErrorRegistry errors;
+    private final ConsistencyProperties props;
 
     /**
      * @return businessKey -> hashHex; empty if cluster unavailable.
@@ -73,6 +75,9 @@ public class ClusterReader {
     /** @return true if query succeeded (even if 0 rows); false on exception. */
     private boolean tryRunInto(IgniteClient client, String sql, HashCalculator hasher,
                                 Map<String, String> hashes) {
+        if (props.isDebugExplainPlans()) {
+            explainAndLog(client, sql, hasher);
+        }
         SqlFieldsQuery q = new SqlFieldsQuery(sql)
                 .setArgs(hasher.queryParams())
                 .setTimeout(60_000, java.util.concurrent.TimeUnit.MILLISECONDS);
@@ -87,6 +92,33 @@ public class ClusterReader {
             log.debug("query failed sql={}: {}", sql, e.toString());
             return false;
         }
+    }
+
+    /**
+     * Run EXPLAIN against the same SQL+params and log the plan.
+     * Runs only when consistency.debug.explain-plans=true. Errors are swallowed —
+     * EXPLAIN is informational only.
+     */
+    private void explainAndLog(IgniteClient client, String sql, HashCalculator hasher) {
+        // Some engines reject EXPLAIN on parameterized queries with unfilled args;
+        // pass the same args. PUBLIC fallback (stripSchemaPrefix) also works for EXPLAIN.
+        try (FieldsQueryCursor<List<?>> cursor = client.query(
+                new SqlFieldsQuery("EXPLAIN " + sql).setArgs(hasher.queryParams()))) {
+            StringBuilder sb = new StringBuilder();
+            int line = 0;
+            for (List<?> row : cursor) {
+                if (line++ > 0) sb.append("\n  ");
+                sb.append(row.get(0));
+            }
+            log.info("EXPLAIN cache={} sql='{}' plan:\n  {}",
+                    hasher.cacheName(), abbreviate(sql), sb);
+        } catch (Exception e) {
+            log.debug("EXPLAIN failed (ignored): {}", e.toString());
+        }
+    }
+
+    private static String abbreviate(String s) {
+        return s.length() > 120 ? s.substring(0, 117) + "..." : s;
     }
 
     /**
