@@ -19,9 +19,30 @@ curl -X POST http://localhost:8080/api/debug/seed -H 'Content-Type: application/
 curl -X POST 'http://localhost:8080/api/debug/analyze-all?clusterId=cluster-1'
 # → { "tables": { "REGISTER":"analyzed", ..., "CLIENT":"reserved-word error" } }
 
+# проверить, что статистика реально записана
+curl -X POST http://localhost:8080/api/debug/exec \
+     -d '{"sql":"SELECT * FROM SYS.STATISTICS_CONFIGURATION","clusterId":"cluster-1"}'
+
 # 3. dump планов
 curl 'http://localhost:8080/api/debug/explain-all?clusterId=cluster-1' > plans.json
 ```
+
+### Эффект ANALYZE — реально проверен
+
+Снят план одного запроса BEFORE / AFTER ANALYZE, замерены `IgniteCost`:
+
+| Узел плана `SQL_PREV_OPER_DATE` (Calcite) | BEFORE | AFTER | Δ |
+|---|---|---|---|
+| `IgniteProject` (верхний) | `rowCount=11.05, cpu=31.87` | `rowCount=12.1, cpu=36.07` | +9.5% / +13% |
+| `IgniteNestedLoopJoin` | `rowCount=10.05, cpu=30.87` | `rowCount=11.1, cpu=35.07` | +10% / +13% |
+| Внутренний JOIN | `rowCount=5.525, cpu=15.93` | `rowCount=6.05, cpu=18.03` | +9.5% / +13% |
+| `IgniteIndexScan` на TURNDOCCUR | `rowCount=1.525, cpu=8.93` | `rowCount=3.05, cpu=12.03` | **+100% / +35%** |
+
+Calcite после ANALYZE узнал реальный объём TURNDOCCUR (7 строк, не дефолтная heuristic 5) и пересчитал cost'ы каждого узла. **Структура плана при этом не изменилась** — индекс один, фильтр точечный, выбор детерминирован.
+
+На production-объёмах (миллионы записей) ANALYZE может **поменять сам shape плана**: например, выбор HashJoin вместо NestedLoopJoin, IndexLookup вместо IndexRange. В smoke этого не видно из-за маленьких таблиц.
+
+H2-планы (default engine) **текстуально идентичны** до и после ANALYZE — Ignite-H2 в основном rule-based для простых WHERE-фильтров. Cost-based ветка работает только в Calcite.
 
 **Состав инвентаризации** — 39 запросов:
 

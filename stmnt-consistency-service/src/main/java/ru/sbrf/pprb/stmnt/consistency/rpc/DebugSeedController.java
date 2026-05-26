@@ -278,6 +278,32 @@ public class DebugSeedController {
     }
 
     /**
+     * Execute arbitrary SQL on one cluster (backdoor for ad-hoc DDL / DROP STATISTICS / etc).
+     * Body: { "sql": "...", "clusterId": "cluster-1" }
+     */
+    @PostMapping("/exec")
+    public Map<String, Object> exec(@RequestBody Map<String, Object> body) {
+        String sql = (String) body.get("sql");
+        String clusterId = (String) body.getOrDefault("clusterId", "cluster-1");
+        if (sql == null || sql.isBlank()) return Map.of("error", "missing 'sql'");
+        IgniteClient client = clientFactory.get(clusterId);
+        if (client == null) return Map.of("error", "cluster not connected: " + clusterId);
+        try {
+            java.util.List<Object> rows = new java.util.ArrayList<>();
+            try (var cur = client.query(new SqlFieldsQuery(sql))) {
+                int n = 0;
+                for (List<?> row : cur) {
+                    if (n++ >= 100) break;
+                    rows.add(row);
+                }
+            }
+            return Map.of("ok", true, "rows", rows);
+        } catch (Exception e) {
+            return Map.of("ok", false, "error", e.toString());
+        }
+    }
+
+    /**
      * Triggers `ANALYZE schema.table` for each known table. After analyze, the
      * planner has fresh row counts / NDV / distribution → better cost-based plans.
      *
