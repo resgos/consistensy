@@ -64,6 +64,13 @@ public interface DayBalancesAdminService extends Service {
     void dailyCleanupNow();
 
     /**
+     * Prune type50 for one register: keeps only the record with MAX(CCOPERATIONDAY),
+     * deletes all earlier. Returns count of deleted rows.
+     * Idempotent; no-op if there are 0 or 1 type50 records.
+     */
+    long pruneOldType50(String registerId);
+
+    /**
      * Serializable DTOs — must not reference Ignite-server-only classes, so
      * we keep them inside the interface for thin-client compatibility.
      */

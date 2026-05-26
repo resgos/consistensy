@@ -7,6 +7,9 @@ import org.springframework.stereotype.Service;
 import ru.sbrf.pprb.stmnt.consistency.config.ConsistencyProperties;
 import ru.sbrf.pprb.stmnt.consistency.lib.hash.HashCalculator;
 import ru.sbrf.pprb.stmnt.consistency.lib.hash.Hashers;
+import ru.sbrf.pprb.stmnt.consistency.lib.repo.ConsistencyRunRepository;
+import ru.sbrf.pprb.stmnt.consistency.lib.repo.HashRepository;
+import ru.sbrf.pprb.stmnt.consistency.lib.repo.MismatchRepository;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -32,7 +35,9 @@ public class ConsistencyJob {
 
     private final ConsistencyProperties props;
     private final ClusterReader reader;
-    private final MismatchRepository repo;
+    private final ConsistencyRunRepository runs;
+    private final HashRepository hashStore;
+    private final MismatchRepository mismatches;
     private final Hashers hashers;
     private final ErrorRegistry errors;
 
@@ -57,7 +62,7 @@ public class ConsistencyJob {
      * @return runId
      */
     public long runAll(String onlyCache) {
-        long runId = repo.startRun(onlyCache);
+        long runId = runs.createRunning(onlyCache);
         int totalMismatches = 0;
         String status = "OK";
         String error = null;
@@ -85,7 +90,7 @@ public class ConsistencyJob {
                     "Run " + runId + " failed", e,
                     java.util.Map.of("runId", runId, "cache", String.valueOf(onlyCache)));
         } finally {
-            repo.finishRun(runId, status, totalMismatches, error);
+            runs.markFinished(runId, status, totalMismatches, error);
             log.info("Run {} done: status={} mismatches={}", runId, status, totalMismatches);
         }
         return runId;
@@ -110,14 +115,14 @@ public class ConsistencyJob {
 
         // Persist raw hashes for audit.
         for (var entry : byCluster.entrySet()) {
-            repo.saveHashesBatch(runId, entry.getKey(), h.cacheName(), entry.getValue());
+            hashStore.saveBatch(runId, entry.getKey(), h.cacheName(), entry.getValue());
         }
 
         // Union of business keys.
         Set<String> allKeys = new HashSet<>();
         for (Map<String, String> m : byCluster.values()) allKeys.addAll(m.keySet());
 
-        List<MismatchRepository.Mismatch> mismatches = new ArrayList<>();
+        List<MismatchRepository.Mismatch> detected = new ArrayList<>();
         for (String bk : allKeys) {
             Map<String, String> hashesForKey = new LinkedHashMap<>();
             String firstHash = null;
@@ -129,26 +134,26 @@ public class ConsistencyJob {
                 else if (!firstHash.equals(hash)) allEqual = false;
             }
             if (!allEqual) {
-                mismatches.add(new MismatchRepository.Mismatch(bk, hashesForKey));
+                detected.add(new MismatchRepository.Mismatch(bk, hashesForKey));
             }
         }
-        repo.saveMismatches(runId, h.cacheName(), mismatches);
-        if (!mismatches.isEmpty()) {
+        mismatches.saveBatch(runId, h.cacheName(), detected);
+        if (!detected.isEmpty()) {
             errors.record("consistency_job", "WARN", "HASH_MISMATCH",
-                    "Detected " + mismatches.size() + " hash mismatches",
-                    java.util.Map.of("cache", h.cacheName(), "count", mismatches.size(),
-                            "examples", mismatches.stream().limit(3)
+                    "Detected " + detected.size() + " hash mismatches",
+                    java.util.Map.of("cache", h.cacheName(), "count", detected.size(),
+                            "examples", detected.stream().limit(3)
                                     .map(MismatchRepository.Mismatch::businessKey).toList()),
                     runId, null, h.cacheName());
         }
-        log.info("Run {} cache {} mismatches={}", runId, h.cacheName(), mismatches.size());
-        return mismatches.size();
+        log.info("Run {} cache {} mismatches={}", runId, h.cacheName(), detected.size());
+        return detected.size();
     }
 
     /** Daily cleanup: purge old runs (and cascaded hashes/mismatches). */
     @Scheduled(cron = "0 30 3 * * *")
     public void purge() {
-        int deleted = repo.purgeOldHashes(props.getHashRetentionDays());
+        int deleted = runs.deleteOlderThan(props.getHashRetentionDays());
         log.info("Retention purge: deleted {} runs older than {} days",
                 deleted, props.getHashRetentionDays());
     }
