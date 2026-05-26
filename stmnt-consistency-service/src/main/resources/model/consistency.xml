@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  DataSpace модель для stmnt-consistency-service.
+
+  Соответствует Flyway-миграциям V1/V2/V3 (PostgreSQL JdbcTemplate реализация
+  сейчас активна). После подключения настоящего DataSpace + dataspace-bom:
+    1. Поднять generator: dataspace создаст entity/repo классы из этого XML
+    2. Реализовать DataSpace*Repository в lib/repo/dataspace/ под уже
+       существующие интерфейсы ConsistencyRunRepository / HashRepository /
+       MismatchRepository / ErrorRepository
+    3. Переключить @ConditionalOnProperty(consistency.repo=dataspace) — JDBC
+       impl выключится, DataSpace встанет на его место. Контракты не меняются.
+
+  В этой модели НЕТ JSONB полей (DataSpace их нативно не поддерживает; в
+  Flyway-схеме они были у consistency_mismatch.hashes_json и
+  consistency_error.details_json). Заменены на String с большим length —
+  Jackson сериализует туда мапу как plain JSON-текст. При чтении на стороне
+  DataSpace-репо парсим обратно через ObjectMapper.
+-->
+<model model-name="consistency"
+       version="DEV-SNAPSHOT"
+       table-prefix="CONSISTENCY"
+       component-code="22222222-2222-2222-2222-222222222222">
+
+    <import type="HISTORY-VERSION" file=""/>
+
+    <!--
+      Один запуск сверки.
+      Соответствует таблице consistency_run (V1__hash_schema.sql).
+    -->
+    <class name="ConsistencyRun" label="consistency_run. Прогон сверки кластеров">
+        <property name="startedAt"     type="LocalDateTime" mandatory="true"
+                  label="Время старта прогона"/>
+        <property name="finishedAt"    type="LocalDateTime"
+                  label="Время завершения (NULL если RUNNING)"/>
+        <property name="cacheName"     type="String" length="64"
+                  label="Кеш, по которому прогон. NULL = все кеши"/>
+        <property name="status"        type="String" length="16" mandatory="true"
+                  label="Статус: RUNNING | OK | MISMATCH | ERROR"/>
+        <property name="mismatchCount" type="BigDecimal" length="10" scale="0" mandatory="true"
+                  label="Количество обнаруженных расхождений"/>
+        <property name="errorMessage"  type="String" length="4000"
+                  label="Сообщение ошибки если status=ERROR"/>
+
+        <index unique="false">
+            <property name="status"/>
+            <property name="startedAt"/>
+        </index>
+        <index unique="false">
+            <property name="startedAt"/>
+        </index>
+    </class>
+
+    <!--
+      Append-only записи хешей по записи каждого кеша на каждом кластере.
+      Соответствует consistency_hash (V1).
+
+      Уникальность по (run, cluster, cache, businessKey) — для idempotency
+      saveBatch'а. Реализация JDBC: ON CONFLICT DO NOTHING.
+    -->
+    <class name="ConsistencyHash" label="consistency_hash. Хеши записей по кластерам">
+        <property name="runId"        type="BigDecimal" length="18" scale="0" mandatory="true"
+                  label="FK на ConsistencyRun"/>
+        <property name="clusterId"    type="String" length="32" mandatory="true"
+                  label="Логический идентификатор кластера"/>
+        <property name="cacheName"    type="String" length="64" mandatory="true"
+                  label="Имя кеша Ignite"/>
+        <property name="businessKey"  type="String" length="512" mandatory="true"
+                  label="Бизнес-ключ записи (детерминированный, не зависит от cluster-id)"/>
+        <property name="hashHex"      type="String" length="32" mandatory="true"
+                  label="MD5 hex (32 символа) канонического представления полей"/>
+
+        <index unique="true">
+            <property name="runId"/>
+            <property name="clusterId"/>
+            <property name="cacheName"/>
+            <property name="businessKey"/>
+        </index>
+        <index unique="false">
+            <property name="cacheName"/>
+            <property name="businessKey"/>
+            <property name="runId"/>
+        </index>
+    </class>
+
+    <!--
+      Детектированное расхождение хешей. Соответствует consistency_mismatch (V2).
+
+      В Flyway-версии hashes_json был JSONB; в DataSpace заменён на String 4000
+      с plain-JSON. ObjectMapper читает/пишет.
+    -->
+    <class name="ConsistencyMismatch" label="consistency_mismatch. Расхождения по бизнес-ключу">
+        <property name="runId"       type="BigDecimal" length="18" scale="0" mandatory="true"
+                  label="FK на ConsistencyRun"/>
+        <property name="cacheName"   type="String" length="64" mandatory="true"
+                  label="Имя кеша"/>
+        <property name="businessKey" type="String" length="512" mandatory="true"
+                  label="Бизнес-ключ записи, по которой расхождение"/>
+        <property name="hashesJson"  type="String" length="4000" mandatory="true"
+                  label="JSON {cluster-id -&gt; hashHex|MISSING}"/>
+        <property name="detectedAt"  type="LocalDateTime" mandatory="true"
+                  label="Время фиксации"/>
+        <property name="resolvedAt"  type="LocalDateTime"
+                  label="Время резолюции. NULL = открыто"/>
+        <property name="notes"       type="String" length="4000"
+                  label="Заметки оператора при резолюции"/>
+
+        <index unique="false">
+            <property name="detectedAt"/>
+        </index>
+        <index unique="false">
+            <property name="cacheName"/>
+            <property name="detectedAt"/>
+        </index>
+    </class>
+
+    <!--
+      Единый реестр ошибок (consistency_error, V3).
+
+      details_json (JSONB в Flyway) → String 4000 в DataSpace.
+      Все 4 источника пишут через ErrorRegistry: consistency_job,
+      cluster_reader, admin_fanout, debug_seed.
+    -->
+    <class name="ConsistencyError" label="consistency_error. Реестр операционных ошибок">
+        <property name="occurredAt"      type="LocalDateTime" mandatory="true"
+                  label="Время события"/>
+        <property name="source"          type="String" length="32" mandatory="true"
+                  label="Источник: consistency_job | cluster_reader | admin_fanout | debug_seed | db | scheduler"/>
+        <property name="level"           type="String" length="16" mandatory="true"
+                  label="ERROR | WARN | INFO"/>
+        <property name="code"            type="String" length="64"
+                  label="Семантический код: CLUSTER_DOWN, QUERY_FAILED, HASH_MISMATCH, INIT_FAILED, ..."/>
+        <property name="message"         type="String" length="4000" mandatory="true"
+                  label="Текст сообщения"/>
+        <property name="detailsJson"     type="String" length="4000"
+                  label="JSON-контекст: cluster, cache, exception, register, ..."/>
+        <property name="relatedRunId"    type="BigDecimal" length="18" scale="0"
+                  label="FK на ConsistencyRun (nullable)"/>
+        <property name="clusterId"       type="String" length="32"
+                  label="Кластер (shortcut для фильтра)"/>
+        <property name="cacheName"       type="String" length="64"
+                  label="Кеш (shortcut для фильтра)"/>
+        <property name="resolvedAt"      type="LocalDateTime"
+                  label="Время резолюции. NULL = открыто"/>
+        <property name="resolutionNotes" type="String" length="4000"
+                  label="Заметки при резолюции"/>
+
+        <index unique="false">
+            <property name="occurredAt"/>
+        </index>
+        <index unique="false">
+            <property name="source"/>
+            <property name="occurredAt"/>
+        </index>
+        <index unique="false">
+            <property name="level"/>
+            <property name="occurredAt"/>
+        </index>
+    </class>
+
+</model>
