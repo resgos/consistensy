@@ -267,6 +267,116 @@ public class DebugSeedController {
         return null;
     }
 
+    /**
+     * Dump EXPLAIN plans for ALL known SQL queries — hasher reads + Ignite-side
+     * DayBalancesRecalcService SQL. Used as one-shot diagnostic before tuning.
+     *
+     * Query params:
+     *   clusterId  — restrict to one cluster (default: cluster-1)
+     *
+     * Response: { sql -> [plan lines...] } for each query.
+     */
+    @GetMapping("/explain-all")
+    public Map<String, Object> explainAll(@RequestParam(defaultValue = "cluster-1") String clusterId) {
+        IgniteClient client = clientFactory.get(clusterId);
+        if (client == null) return Map.of("error", "cluster not connected: " + clusterId);
+
+        // ---- Список ВСЕХ SQL для проверки ----
+        // Hasher reads (consistency-service)
+        java.util.LinkedHashMap<String, String> queries = new java.util.LinkedHashMap<>();
+        queries.put("hasher.REGISTER",
+                "SELECT OBJECTID, CCRQTM, CCOPENDATE, CCCLOSEDATE, CURRENCY, CCBALANCERECALCDATE FROM REGISTER");
+        queries.put("hasher.TURN_DOC_CUR",
+                "SELECT OBJECTID, CCTYPEOPER, CCSTARTSUM, CCSTARTSUMNAT, CCIDEKS, REGISTER, CCSUM, CCRQUID " +
+                        "FROM TURNDOCCUR WHERE CCOPERATIONDAY >= DATE '2026-05-22'");
+        queries.put("hasher.CLIENT",
+                "SELECT OBJECTID, CCEPK, CCRQTM, CCNAME, CCINN FROM CLIENT");
+        queries.put("hasher.CURRENCY",
+                "SELECT OBJECTID, CCEKSCODE, CCEXTCODE, CCNAME, CCALPHACODE, CCALPHANUMCODE FROM CURRENCY");
+        queries.put("hasher.DAY_BALANCES",
+                "SELECT REGISTER, CCOPERATIONDAY, CCSTARTSUM, CCSTARTSUMNAT, CCDTSUM, CCDTSUMNAT, " +
+                        "CCKTSUM, CCKTSUMNAT, CCDTCOUNT, CCKTCOUNT, CCFINISHSUM, CCFINISHSUMNAT " +
+                        "FROM DAYBALANCES WHERE CCOPERATIONDAY >= DATE '2026-05-22'");
+        queries.put("hasher.DIVISION",
+                "SELECT OBJECTID, CCTBCODE, CCOSBCODE, CCFULLDIVCODE, CCFULLNAME, CCBIC, CCINN, CCKPP, CCRQTM " +
+                        "FROM DIVISION");
+        queries.put("hasher.INCOME_SALDO",
+                "SELECT OBJECTID, REGISTER, CCDATE, CCSYSTEMID, CCSTARTSUM, CCSTARTSUMNAT, CCVALIDSALDO " +
+                        "FROM INCOMESALDO");
+        queries.put("hasher.CB_RATE",
+                "SELECT OBJECTID, CCCODE, CCDATE, CCRATE, CCLOTSIZE FROM CBRATE");
+        queries.put("hasher.CASH_SYMBOL_DOC",
+                "SELECT OBJECTID, REGISTER, NUMBER, TURNDOCID, CCCODE, CCSOURCE, CCSUM, CCPRIORITY " +
+                        "FROM CASHSYMBOLDOC");
+
+        // ---- DayBalancesRecalcService SQL (Ignite-side) ----
+        queries.put("daybalances.SQL_REGISTERS_FOR_RECALC",
+                "SELECT R.OBJECTID, R.CCBALANCERECALCDATE, R.CCDAYBALANCESBEGINDATE, R.CCOPENDATE, R.CCREESTRRECALCDATE " +
+                        "FROM REGISTER R WHERE R.CCBALANCERECALCDATE IS NOT NULL " +
+                        "AND R.CCBALANCERECALCDATE < DATE '2026-05-26' AND R.CCOPENDATE >= '2000-01-01'");
+        queries.put("daybalances.SQL_ACTIVE_REGISTERS",
+                "SELECT R.OBJECTID, R.CCBALANCERECALCDATE FROM REGISTER R " +
+                        "WHERE R.CCOPENDATE <= DATE '2026-05-25' " +
+                        "AND (R.CCCLOSEDATE IS NULL OR R.CCCLOSEDATE >= DATE '2026-05-25') " +
+                        "AND R.CCOPENDATE >= '2000-01-01'");
+        queries.put("daybalances.SQL_DAY_AGGREGATES_RANGE",
+                "SELECT CCOPERATIONDAY, CCDT, SUM(CCSUM), COUNT(*), MAX(CCDATE) FROM (" +
+                        "SELECT CCOPERATIONDAY, CCDT, CCSUM, CCDATE FROM TURNDOCCUR " +
+                        "WHERE REGISTER='R001' AND CCTYPEOPER=0 AND CCOPERATIONDAY>=DATE '2026-05-22' AND CCOPERATIONDAY<=DATE '2026-05-24' " +
+                        "UNION ALL " +
+                        "SELECT CCOPERATIONDAY, CCDT, CCSUM, CCDATE FROM TURNDOCCUR " +
+                        "WHERE REGISTER='R001' AND CCTYPEOPER=40 AND CCOPERATIONDAY>=DATE '2026-05-22' AND CCOPERATIONDAY<=DATE '2026-05-24'" +
+                        ") GROUP BY CCOPERATIONDAY, CCDT");
+        queries.put("daybalances.SQL_START_SUM_SV4",
+                "SELECT COALESCE(SUM(CASE WHEN CCDT='1' THEN -1*CCSUM ELSE CCSUM END), 0)," +
+                        " COALESCE(SUM(CASE WHEN CCDT='1' THEN -1*CCSUMNAT ELSE CCSUMNAT END), 0) " +
+                        "FROM TURNDOCCUR WHERE REGISTER='R001' AND CCTYPEOPER IN (0,40) AND CCOPERATIONDAY<DATE '2026-05-22'");
+        queries.put("daybalances.SQL_SUM_BETWEEN",
+                "SELECT COALESCE(SUM(CASE WHEN CCDT='1' THEN -1*CCSUM ELSE CCSUM END), 0)," +
+                        " COALESCE(SUM(CASE WHEN CCDT='1' THEN -1*CCSUMNAT ELSE CCSUMNAT END), 0) " +
+                        "FROM TURNDOCCUR WHERE REGISTER='R001' AND CCTYPEOPER IN (0,40) " +
+                        "AND CCOPERATIONDAY>=DATE '2026-05-22' AND CCOPERATIONDAY<DATE '2026-05-25'");
+        queries.put("daybalances.SQL_PREV_OPER_DATE",
+                "SELECT /*+ QUERY_ENGINE('calcite') */ GREATEST(" +
+                        "COALESCE((SELECT MAX(CCOPERATIONDAY) FROM TURNDOCCUR " +
+                        " WHERE REGISTER='R001' AND CCTYPEOPER=0 AND CCOPERATIONDAY<DATE '2026-05-24'), DATE '1900-01-01')," +
+                        "COALESCE((SELECT MAX(CCOPERATIONDAY) FROM TURNDOCCUR " +
+                        " WHERE REGISTER='R001' AND CCTYPEOPER=40 AND CCOPERATIONDAY<DATE '2026-05-24'), DATE '1900-01-01'))");
+        queries.put("daybalances.SQL_FIND_TYPE50",
+                "SELECT OBJECTID, REGISTER, CCSTARTSUM, CCSTARTSUMNAT, EXPROP5 FROM TURNDOCCUR " +
+                        "WHERE REGISTER='R001' AND CCTYPEOPER=50 AND CCOPERATIONDAY=DATE '2026-05-24' LIMIT 1");
+        queries.put("daybalances.SQL_TYPE50_START_ON_DATE",
+                "SELECT CCSTARTSUM, CCSTARTSUMNAT FROM TURNDOCCUR " +
+                        "WHERE REGISTER='R001' AND CCTYPEOPER=50 AND CCOPERATIONDAY=DATE '2026-05-24' LIMIT 1");
+        queries.put("daybalances.SQL_TYPE50_START_BEFORE",
+                "SELECT /*+ QUERY_ENGINE('calcite') */ CCSTARTSUM, CCSTARTSUMNAT, CCOPERATIONDAY " +
+                        "FROM TURNDOCCUR WHERE REGISTER='R001' AND CCTYPEOPER=50 AND CCOPERATIONDAY<DATE '2026-05-24' " +
+                        "ORDER BY CCOPERATIONDAY DESC LIMIT 1");
+        queries.put("daybalances.SQL_CB_RATE",
+                "SELECT CCRATE FROM CBRATE WHERE CCCODE='USD' AND CCDATE=DATE '2026-05-24'");
+        queries.put("daybalances.SQL_COUNT_NONTYPE50_ON_DAY",
+                "SELECT COUNT(*) FROM TURNDOCCUR " +
+                        "WHERE REGISTER='R001' AND CCTYPEOPER IN (0,40) AND CCOPERATIONDAY=DATE '2026-05-24'");
+        queries.put("daybalances.findRegistersWithActivityOnDay",
+                "SELECT DISTINCT REGISTER FROM TURNDOCCUR WHERE CCOPERATIONDAY=DATE '2026-05-24'");
+        queries.put("daybalances.findAllPrimaryRegistersWithType50",
+                "SELECT DISTINCT REGISTER FROM TURNDOCCUR WHERE CCTYPEOPER=50");
+        queries.put("daybalances.pruneOldType50_max",
+                "SELECT MAX(CCOPERATIONDAY) FROM TURNDOCCUR WHERE REGISTER='R001' AND CCTYPEOPER=50");
+
+        Map<String, Object> plans = new java.util.LinkedHashMap<>();
+        for (var e : queries.entrySet()) {
+            try (var cur = client.query(new SqlFieldsQuery("EXPLAIN " + e.getValue()))) {
+                java.util.List<String> lines = new java.util.ArrayList<>();
+                for (List<?> row : cur) lines.add(String.valueOf(row.get(0)));
+                plans.put(e.getKey(), Map.of("sql", e.getValue(), "plan", lines));
+            } catch (Exception ex) {
+                plans.put(e.getKey(), Map.of("sql", e.getValue(), "error", ex.toString()));
+            }
+        }
+        return Map.of("clusterId", clusterId, "queries_count", queries.size(), "plans", plans);
+    }
+
     @PostMapping("/reset")
     public Map<String, Object> reset() {
         Map<String, Object> res = new HashMap<>();
@@ -274,11 +384,10 @@ public class DebugSeedController {
             IgniteClient client = clientFactory.get(c.getId());
             if (client == null) { res.put(c.getId(), "not connected"); continue; }
             try {
-                exec(client, "DELETE FROM REGISTER");
-                exec(client, "DELETE FROM CURRENCY");
-                exec(client, "DELETE FROM DAYBALANCES");
-                exec(client, "DELETE FROM CLIENT");
-                exec(client, "DELETE FROM CBRATE");
+                for (String t : List.of("REGISTER", "CURRENCY", "DAYBALANCES", "CLIENT", "CBRATE",
+                        "TURNDOCCUR", "DIVISION", "INCOMESALDO", "CASHSYMBOLDOC", "TURNDOCCURREESTR")) {
+                    try { exec(client, "DELETE FROM " + t); } catch (Exception ignored) {}
+                }
                 res.put(c.getId(), "cleared");
             } catch (Exception e) { res.put(c.getId(), "err: " + e); }
         }
@@ -289,7 +398,8 @@ public class DebugSeedController {
 
     private void seedOne(IgniteClient client, String currencyForR001) {
         // Drop legacy tables (no-op if absent)
-        for (String t : List.of("REGISTER", "CURRENCY", "DAYBALANCES", "CLIENT", "CBRATE")) {
+        for (String t : List.of("REGISTER", "CURRENCY", "DAYBALANCES", "CLIENT", "CBRATE",
+                "TURNDOCCUR", "DIVISION", "INCOMESALDO", "CASHSYMBOLDOC", "TURNDOCCURREESTR")) {
             try { exec(client, "DROP TABLE IF EXISTS PUBLIC." + t); } catch (Exception ignored) {}
         }
 
@@ -377,6 +487,104 @@ public class DebugSeedController {
                 "USD_20260524", "USD", Date.valueOf("2026-05-24"), bd("90.50"), bd("1"));
         execArgs(client, "INSERT INTO CBRATE VALUES (?,?,?,?,?)",
                 "EUR_20260524", "EUR", Date.valueOf("2026-05-24"), bd("98.20"), bd("1"));
+
+        // ---- TURN_DOC_CUR (нужна для EXPLAIN всех Ignite-side запросов) ----
+        exec(client,
+                "CREATE TABLE IF NOT EXISTS TURNDOCCUR (" +
+                        "  OBJECTID VARCHAR PRIMARY KEY," +
+                        "  REGISTER VARCHAR, CCDATE TIMESTAMP, CCIDEKS VARCHAR, CCDT VARCHAR(1)," +
+                        "  CCSTARTSUM DECIMAL(20,6), CCSTARTSUMNAT DECIMAL(20,6)," +
+                        "  CCSUM DECIMAL(20,6), CCSUMNAT DECIMAL(20,6)," +
+                        "  CCSUMPO DECIMAL(20,6)," +
+                        "  CCTYPEOPER DECIMAL(3), CCRQTM TIMESTAMP, CCRQUID VARCHAR," +
+                        "  CCOPERATIONDAY DATE, CCTYPEDOC VARCHAR, CCTRANSACTIONID VARCHAR," +
+                        "  CCNUM VARCHAR, CCDATEDOC TIMESTAMP, CCPURPOSE VARCHAR," +
+                        "  EXPROP5 VARCHAR, LASTMODIFYTIME TIMESTAMP, EXPROP2 VARCHAR" +
+                        ") WITH \"CACHE_NAME=TURN_DOC_CUR, VALUE_TYPE=TurnDocCur\"");
+        exec(client, "DELETE FROM TURNDOCCUR");
+        // Индексы — чтобы EXPLAIN-планы показали реальные структуры доступа
+        exec(client, "CREATE INDEX IF NOT EXISTS IDX_TDC_REG_OP ON TURNDOCCUR(REGISTER, CCOPERATIONDAY)");
+        exec(client, "CREATE INDEX IF NOT EXISTS IDX_TDC_REG_TYPE_OP ON TURNDOCCUR(REGISTER, CCTYPEOPER, CCOPERATIONDAY)");
+
+        // несколько проводок и type50-якорь
+        for (int d = 22; d <= 24; d++) {
+            // оборот по DT
+            execArgs(client,
+                    "INSERT INTO TURNDOCCUR (OBJECTID, REGISTER, CCDATE, CCIDEKS, CCDT, CCSUM, CCSUMNAT, " +
+                            "CCTYPEOPER, CCRQTM, CCRQUID, CCOPERATIONDAY, CCTRANSACTIONID) " +
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "R001:T" + d + "D", "R001",
+                    java.sql.Timestamp.valueOf("2026-05-" + d + " 10:00:00"),
+                    "ID" + d + "D", "1", bd("100.00"), bd("100.00"),
+                    new BigDecimal(0), java.sql.Timestamp.valueOf("2026-05-" + d + " 10:00:01"),
+                    "RQ" + d + "D", Date.valueOf("2026-05-" + d), "TX" + d + "D");
+            // оборот по KT
+            execArgs(client,
+                    "INSERT INTO TURNDOCCUR (OBJECTID, REGISTER, CCDATE, CCIDEKS, CCDT, CCSUM, CCSUMNAT, " +
+                            "CCTYPEOPER, CCRQTM, CCRQUID, CCOPERATIONDAY, CCTRANSACTIONID) " +
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "R001:T" + d + "K", "R001",
+                    java.sql.Timestamp.valueOf("2026-05-" + d + " 11:00:00"),
+                    "ID" + d + "K", "0", bd("50.00"), bd("50.00"),
+                    new BigDecimal(0), java.sql.Timestamp.valueOf("2026-05-" + d + " 11:00:01"),
+                    "RQ" + d + "K", Date.valueOf("2026-05-" + d), "TX" + d + "K");
+        }
+        // type50-якорь
+        execArgs(client,
+                "INSERT INTO TURNDOCCUR (OBJECTID, REGISTER, CCDATE, CCIDEKS, CCDT, " +
+                        "CCSTARTSUM, CCSTARTSUMNAT, CCSUM, CCSUMNAT, " +
+                        "CCTYPEOPER, CCRQTM, CCRQUID, CCOPERATIONDAY, EXPROP5) " +
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "R001:T50_R001_20260524", "R001",
+                java.sql.Timestamp.valueOf("2026-05-24 00:00:00"),
+                "T50_R001_20260524", "0", bd("1000.00"), bd("1000.00"), bd("0"), bd("0"),
+                new BigDecimal(50), java.sql.Timestamp.valueOf("2026-05-24 00:00:00"),
+                "RecalcDayStartSumm-T50_R001_20260524", Date.valueOf("2026-05-24"), null);
+
+        // ---- DIVISION ----
+        exec(client,
+                "CREATE TABLE IF NOT EXISTS DIVISION (" +
+                        "  OBJECTID VARCHAR PRIMARY KEY, CCTBCODE VARCHAR, CCOSBCODE VARCHAR," +
+                        "  CCFULLDIVCODE VARCHAR, CCFULLNAME VARCHAR," +
+                        "  CCBIC VARCHAR, CCINN VARCHAR, CCKPP VARCHAR, CCRQTM TIMESTAMP" +
+                        ") WITH \"CACHE_NAME=DIVISION, VALUE_TYPE=Division\"");
+        exec(client, "DELETE FROM DIVISION");
+        execArgs(client, "INSERT INTO DIVISION VALUES (?,?,?,?,?,?,?,?,?)",
+                "D001", "01", "100", "01100000", "ГО Сбербанк",
+                "044525225", "7707083893", "773601001",
+                java.sql.Timestamp.valueOf("2026-01-01 00:00:00"));
+
+        // ---- INCOME_SALDO ----
+        exec(client,
+                "CREATE TABLE IF NOT EXISTS INCOMESALDO (" +
+                        "  OBJECTID VARCHAR PRIMARY KEY, REGISTER VARCHAR, CCDATE DATE," +
+                        "  CCSYSTEMID VARCHAR, CCSTARTSUM DECIMAL(20,6), CCSTARTSUMNAT DECIMAL(20,6)," +
+                        "  CCVALIDSALDO VARCHAR(1)" +
+                        ") WITH \"CACHE_NAME=INCOME_SALDO, VALUE_TYPE=IncomeSaldo\"");
+        exec(client, "DELETE FROM INCOMESALDO");
+        execArgs(client, "INSERT INTO INCOMESALDO VALUES (?,?,?,?,?,?,?)",
+                "IS001", "R001", Date.valueOf("2026-05-24"),
+                "SYS_A", bd("1000.00"), bd("1000.00"), "1");
+
+        // ---- CASH_SYMBOL_DOC ----
+        exec(client,
+                "CREATE TABLE IF NOT EXISTS CASHSYMBOLDOC (" +
+                        "  OBJECTID VARCHAR PRIMARY KEY, REGISTER VARCHAR, NUMBER VARCHAR," +
+                        "  TURNDOCID VARCHAR, CCCODE VARCHAR, CCSOURCE VARCHAR," +
+                        "  CCSUM DECIMAL(20,6), CCPRIORITY VARCHAR" +
+                        ") WITH \"CACHE_NAME=CASH_SYMBOL_DOC, VALUE_TYPE=CashSymbolDoc\"");
+        exec(client, "DELETE FROM CASHSYMBOLDOC");
+        execArgs(client, "INSERT INTO CASHSYMBOLDOC VALUES (?,?,?,?,?,?,?,?)",
+                "CS001", "R001", "01", "R001:T22D", "TRF", "PPRB", bd("100.00"), "1");
+
+        // ---- TURN_DOC_CUR_REESTR ----
+        exec(client,
+                "CREATE TABLE IF NOT EXISTS TURNDOCCURREESTR (" +
+                        "  OBJECTID VARCHAR PRIMARY KEY, REGISTER VARCHAR," +
+                        "  CCOPERATIONDAY DATE, CCIDEKS VARCHAR, CCREESTRID VARCHAR," +
+                        "  CCSUM DECIMAL(20,6), CCSUMNAT DECIMAL(20,6)" +
+                        ") WITH \"CACHE_NAME=TURN_DOC_CUR_REESTR, VALUE_TYPE=TurnDocCurReestr\"");
+        exec(client, "DELETE FROM TURNDOCCURREESTR");
     }
 
     private void applyScenarioOne(IgniteClient c, String clusterId, String scenario) {
