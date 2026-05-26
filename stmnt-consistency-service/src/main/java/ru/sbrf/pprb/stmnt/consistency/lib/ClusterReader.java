@@ -102,8 +102,10 @@ public class ClusterReader {
     private void explainAndLog(IgniteClient client, String sql, HashCalculator hasher) {
         // Some engines reject EXPLAIN on parameterized queries with unfilled args;
         // pass the same args. PUBLIC fallback (stripSchemaPrefix) also works for EXPLAIN.
+        String prefix = sql.toLowerCase(java.util.Locale.ROOT).contains("query_engine('calcite')")
+                ? "EXPLAIN PLAN FOR " : "EXPLAIN ";
         try (FieldsQueryCursor<List<?>> cursor = client.query(
-                new SqlFieldsQuery("EXPLAIN " + sql).setArgs(hasher.queryParams()))) {
+                new SqlFieldsQuery(prefix + sql).setArgs(hasher.queryParams()))) {
             StringBuilder sb = new StringBuilder();
             int line = 0;
             for (List<?> row : cursor) {

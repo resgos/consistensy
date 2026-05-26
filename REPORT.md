@@ -602,6 +602,8 @@ done
 - `DayBalancesAdminService` (Ignite cluster-singleton service) написан, скомпилирован, готов к деплою, но не задеплоен в vanilla `apacheignite/ignite:2.16.0`-контейнерах. Для использования endpoint'ов `/api/admin/*` нужно собрать кастомный Ignite-image с JAR'ом из `stmnt-ignite_precalc/stmnt-ignite-lib`, что требует доступа к корпоративному Nexus (`com.sbt.ignite:*`).
 - `EnrichDirectory` hasher — пропущен по спецификации, нужно сначала добавить `CCVERSION`/`RQUID` в DTO.
 
+Calcite SQL engine **подключён** в smoke через `OPTION_LIBS=ignite-calcite` + `SqlConfiguration` — Calcite-планы для `SQL_PREV_OPER_DATE` и `SQL_TYPE50_START_BEFORE` доступны и сняты (см. [PLANS.md](PLANS.md)).
+
 Всё остальное (`/api/consistency/*`, `/api/admin/*` от консьюмеров, `/api/errors/*`, `/api/debug/*`, hashers по всем 9 поддерживаемым кешам, Error Registry) работает на чистых Apache Ignite контейнерах прямо сейчас.
 
 ---

@@ -88,6 +88,16 @@ public class DebugSeedController {
     }
 
     /**
+     * Calcite's EXPLAIN syntax differs from H2's: it requires "EXPLAIN PLAN FOR ...".
+     * If the SQL carries a Calcite hint — use Calcite's form; otherwise — H2's.
+     */
+    private static String explainPrefix(String sql) {
+        if (sql == null) return "EXPLAIN ";
+        String lower = sql.toLowerCase(java.util.Locale.ROOT);
+        return lower.contains("query_engine('calcite')") ? "EXPLAIN PLAN FOR " : "EXPLAIN ";
+    }
+
+    /**
      * Manual EXPLAIN — useful for ad-hoc inspection of query plans on each cluster.
      * Body: { "sql": "...", "clusterId": "cluster-1" (optional → all) }
      */
@@ -106,7 +116,7 @@ public class DebugSeedController {
                 result.put(c.getId(), "not connected");
                 continue;
             }
-            try (var cursor = client.query(new SqlFieldsQuery("EXPLAIN " + sql))) {
+            try (var cursor = client.query(new SqlFieldsQuery(explainPrefix(sql) + sql))) {
                 java.util.List<String> lines = new java.util.ArrayList<>();
                 for (List<?> row : cursor) lines.add(String.valueOf(row.get(0)));
                 result.put(c.getId(), lines);
@@ -366,7 +376,7 @@ public class DebugSeedController {
 
         Map<String, Object> plans = new java.util.LinkedHashMap<>();
         for (var e : queries.entrySet()) {
-            try (var cur = client.query(new SqlFieldsQuery("EXPLAIN " + e.getValue()))) {
+            try (var cur = client.query(new SqlFieldsQuery(explainPrefix(e.getValue()) + e.getValue()))) {
                 java.util.List<String> lines = new java.util.ArrayList<>();
                 for (List<?> row : cur) lines.add(String.valueOf(row.get(0)));
                 plans.put(e.getKey(), Map.of("sql", e.getValue(), "plan", lines));

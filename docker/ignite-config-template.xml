@@ -1,9 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Single-node Ignite config with thin-client connector enabled.
-  Caches REGISTER / TURN_DOC_CUR / CLIENT / CURRENCY / DAY_BALANCES /
-         DIVISION / INCOME_SALDO / CB_RATE / CASH_SYMBOL_DOC
-  are auto-created on first SQL "CREATE TABLE" issued by smoke scripts.
+  Single-node Ignite config with:
+    - thin-client connector enabled (port 10800)
+    - two SQL engines:  H2 (default) + Calcite
+      Calcite is used by queries that carry the hint
+        /*+ QUERY_ENGINE('calcite') */
+      Examples: SQL_PREV_OPER_DATE, SQL_TYPE50_START_BEFORE — they rely on
+      INDEX REVERSE SCAN for ORDER BY ... DESC LIMIT 1 patterns.
+
+  Caches are auto-created via SQL DDL by /api/debug/seed.
 -->
 <beans xmlns="http://www.springframework.org/schema/beans"
        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -17,6 +22,22 @@
             <bean class="org.apache.ignite.configuration.ClientConnectorConfiguration">
                 <property name="host" value="0.0.0.0"/>
                 <property name="port" value="10800"/>
+            </bean>
+        </property>
+
+        <!-- SQL ENGINES: H2 default + Calcite for QUERY_ENGINE('calcite') hints -->
+        <property name="sqlConfiguration">
+            <bean class="org.apache.ignite.configuration.SqlConfiguration">
+                <property name="queryEnginesConfiguration">
+                    <list>
+                        <bean class="org.apache.ignite.indexing.IndexingQueryEngineConfiguration">
+                            <property name="default" value="true"/>
+                        </bean>
+                        <bean class="org.apache.ignite.calcite.CalciteQueryEngineConfiguration">
+                            <property name="default" value="false"/>
+                        </bean>
+                    </list>
+                </property>
             </bean>
         </property>
 

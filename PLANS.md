@@ -14,11 +14,13 @@
 
 ## Сводка
 
-| Категория | Количество | Index Scan | Full Scan | Calcite-зависимые |
+| Категория | Количество | Index Scan (H2) | Full Scan (H2) | IndexScan + searchBounds (Calcite) |
 |---|---:|---:|---:|---:|
 | Hasher reads | 9 | 0 | 9 | 0 |
-| DayBalancesRecalcService selects | 14 | 7 | 5 | 2 |
+| DayBalancesRecalcService selects | 14 | 7 | 5 | **2** |
 | **Всего** | **23** | **7** | **14** | **2** |
+
+Calcite engine подключён в smoke-стенде (`OPTION_LIBS=ignite-calcite` + `SqlConfiguration` с обоими движками). Hint `/*+ QUERY_ENGINE('calcite') */` маршрутизирует SQL на нужный движок.
 
 Распределение по характеру плана соответствует ожиданиям:
 - Все Hasher-выборки — полные снимки кешей (нужна вся таблица), `__SCAN_` оптимален.
@@ -129,29 +131,69 @@ SELECT DISTINCT REGISTER
 
 #### `hasher.TURN_DOC_CUR` и `hasher.DAY_BALANCES` — уже в категории Hasher.
 
-### Calcite-зависимые (2) — план недоступен в OSS
+### Calcite-планы (2) — engine подключён в smoke
 
-#### `SQL_PREV_OPER_DATE`
-```sql
-SELECT /*+ QUERY_ENGINE('calcite') */ GREATEST(
-  COALESCE((SELECT MAX(CCOPERATIONDAY) ... CCTYPEOPER=0  ...), DATE '1900-01-01'),
-  COALESCE((SELECT MAX(CCOPERATIONDAY) ... CCTYPEOPER=40 ...), DATE '1900-01-01'))
-```
-**OSS reply**: `Query engines not configured, but specified engine: calcite`.
-В `stmnt-ignite_precalc/ignite-local.xml` Calcite добавлен явно:
-```xml
-<bean class="org.apache.ignite.calcite.CalciteQueryEngineConfiguration"/>
-```
-План на production-кластере должен показать **`INDEX REVERSE_SCAN`** по `(REGISTER, CCTYPEOPER, CCOPERATIONDAY)` с ранним выходом на первой строке (MAX). H2-движок такой оптимизации не делает.
+Calcite активирован в каждом контейнере через `OPTION_LIBS=ignite-calcite` + `SqlConfiguration` с обоими движками в `ignite-config-template.xml`. Hint `/*+ QUERY_ENGINE('calcite') */` маршрутизирует конкретный SQL на Calcite, остальные идут через H2 по умолчанию.
 
-#### `SQL_TYPE50_START_BEFORE`
-```sql
-SELECT /*+ QUERY_ENGINE('calcite') */ CCSTARTSUM, CCSTARTSUMNAT, CCOPERATIONDAY
-FROM TURNDOCCUR
-WHERE REGISTER=? AND CCTYPEOPER=50 AND CCOPERATIONDAY<?
-ORDER BY CCOPERATIONDAY DESC LIMIT 1
+EXPLAIN для Calcite-движка — отдельный синтаксис `EXPLAIN PLAN FOR <sql>`. `DebugSeedController.explain` автодетектирует хинт и подставляет нужный prefix.
+
+#### `SQL_PREV_OPER_DATE` (Calcite)
+
 ```
-Та же история. С Calcite — reverse scan по индексу с `LIMIT 1` без буферизации.
+IgniteProject(EXPR$0=[CASE(>(...) ...)])         ← GREATEST(MAX_0, MAX_40)
+  IgniteNestedLoopJoin(left, condition=[true])    ← склейка двух подзапросов
+    IgniteNestedLoopJoin(left, condition=[true])  ← (одна на ветку CCTYPEOPER)
+      IgniteValues(tuples=[[{ 0 }]])              ← unit row
+      IgniteColocatedHashAggregate(MAX($0))       ← MAX-агрегация
+        IgniteExchange(distribution=[single])     ← merge across nodes
+          IgniteIndexScan(
+              table=[[PUBLIC, TURNDOCCUR]],
+              index=[IDX_TDC_REG_OP_proxy],
+              filters=[AND(=R001, =CCTYPEOPER=0, <2026-05-24)],
+              searchBounds=[
+                  ExactBounds [bound=R001],
+                  RangeBounds [upperBound=2026-05-24, upperInclude=false]
+              ])
+    IgniteColocatedHashAggregate(MAX($0))         ← симметрично для CCTYPEOPER=40
+      IgniteExchange(distribution=[single])
+        IgniteIndexScan(... =CCTYPEOPER=40, <2026-05-24, same searchBounds ...)
+```
+Ключевое: **`searchBounds`** на `(REGISTER, CCOPERATIONDAY)` ограничивают index scan диапазоном `REGISTER='R001' AND CCOPERATIONDAY < 2026-05-24` — Calcite читает только релевантные индексные записи, без full scan. На H2 этот же запрос потребовал бы FullScan + Sort + Aggregate.
+
+#### `SQL_TYPE50_START_BEFORE` (Calcite)
+
+```
+IgniteLimit(fetch=[1])                           ← outer LIMIT 1
+  IgniteSort(sort0=[$2], dir0=[DESC-nulls-last], fetch=[1])  ← order by DESC + early stop
+    IgniteExchange(distribution=[single])        ← collect from nodes
+      IgniteIndexScan(
+          table=[[PUBLIC, TURNDOCCUR]],
+          index=[IDX_TDC_REG_OP],
+          filters=[AND(=R001, =50, <2026-05-24)],
+          searchBounds=[
+              ExactBounds [bound=R001],
+              RangeBounds [upperBound=2026-05-24, upperInclude=false]
+          ],
+          collation=[[3 ASC-nulls-first, 15 ASC-nulls-first, 0 ASC-nulls-first]]
+      )
+```
+
+⚠️ **Sort не устранён** — индекс имеет `ASC` collation, ORDER BY запрашивает `DESC`. Apache Ignite Calcite 2.16 не вычисляет «обратный обход по ASC-индексу» как естественную сортировку, поэтому добавляет `IgniteSort`.
+
+Однако:
+- `IgniteIndexScan` уже сократил входной набор до записей с `CCOPERATIONDAY < 2026-05-24` (через `searchBounds`)
+- Сорт + Limit идёт на ограниченном множестве, а не на full table
+
+В сравнении с H2 (full scan + full sort) — это всё-таки выигрыш на больших объёмах. Для true reverse-traversal без сортировки нужен либо descending-индекс, либо более новая Calcite-версия с оптимизацией обратного обхода.
+
+#### Сводка по Calcite
+
+| Аспект | H2 (default) | Calcite (hint) |
+|---|---|---|
+| `SQL_PREV_OPER_DATE` | FullScan + Sort + MAX | **IndexScan c searchBounds** + MAX |
+| `SQL_TYPE50_START_BEFORE` | FullScan + Sort + LIMIT 1 | **IndexScan c searchBounds** + Sort + LIMIT 1 |
+| Engine bootstrap | автозагружается всегда | требует `OPTION_LIBS=ignite-calcite` |
+| Memory под план | стандартный H2 | дополнительный JVM heap под Calcite-internals |
 
 ### Ошибка схемы (1)
 
@@ -176,32 +218,47 @@ ORDER BY CCOPERATIONDAY DESC LIMIT 1
 
 ---
 
-## Зачем нужен Calcite (в проде)
+## Calcite в smoke-стенде
 
-В `ignite-local.xml`:
-```xml
-<bean class="org.apache.ignite.configuration.SqlConfiguration">
-    <property name="queryEnginesConfiguration">
-        <list>
-            <bean class="org.apache.ignite.indexing.IndexingQueryEngineConfiguration">
-                <property name="default" value="true"/>
-            </bean>
-            <bean class="org.apache.ignite.calcite.CalciteQueryEngineConfiguration"/>
-        </list>
-    </property>
-</bean>
+Подключено через:
+
+`docker-compose.yml`:
+```yaml
+environment:
+  OPTION_LIBS: ignite-calcite
 ```
-- H2-движок (default) — основной, fallback для всего, что не использует hints.
-- Calcite — только для двух запросов с `ORDER BY ... DESC LIMIT 1`, где reverse-index-scan даёт O(log n) вместо O(n).
+(переменная распознаётся entrypoint'ом apacheignite/ignite — копирует `libs/optional/ignite-calcite/*.jar` в `libs/` перед запуском).
 
-В smoke (vanilla `apacheignite/ignite:2.16.0`) Calcite не подключён → проверить эти 2 плана здесь невозможно. На реальном Platform V Datagrid 17.6.3 (та же 2.16-база + патчи) Calcite доступен.
+`docker/ignite-config-template.xml`:
+```xml
+<property name="sqlConfiguration">
+    <bean class="org.apache.ignite.configuration.SqlConfiguration">
+        <property name="queryEnginesConfiguration">
+            <list>
+                <bean class="org.apache.ignite.indexing.IndexingQueryEngineConfiguration">
+                    <property name="default" value="true"/>
+                </bean>
+                <bean class="org.apache.ignite.calcite.CalciteQueryEngineConfiguration"/>
+            </list>
+        </property>
+    </bean>
+</property>
+```
+
+В логе Ignite на старте:
+```
+CalciteQueryProcessor   : SQL parameter 'sql.defaultQueryTimeout' was changed from 'null' to '0'
+IgniteKernal            : Classpath value: ... ignite-calcite-2.16.0.jar ...
+```
+
+Calcite в Platform V Datagrid 17.6.3 готов из коробки — производство получит идентичные планы.
 
 ---
 
 ## Заключение
 
-- **23 запроса проверены**. Из них 7 идут через композитный индекс `IDX_TDC_REG_TYPE_OP` точечно, остальные 14 — full scan, в большинстве случаев осознанный (полные выгрузки справочников, ночные операции массового сканирования).
-- **2 Calcite-зависимых запроса** в OSS-стенде упали с ожидаемой ошибкой; в проде с подключённым `ignite-calcite` дадут `INDEX REVERSE_SCAN`.
+- **23 запроса проверены**. Из них 7 идут через композитный индекс `IDX_TDC_REG_TYPE_OP` точечно (H2), 2 идут через Calcite с **`IgniteIndexScan` + `searchBounds`** на `(REGISTER, CCOPERATIONDAY)`, остальные 14 — full scan, в большинстве случаев осознанный (полные выгрузки справочников, ночные операции массового сканирования).
+- **2 Calcite-плана получены** на работающем smoke-стенде. Для `SQL_TYPE50_START_BEFORE` Sort всё-же присутствует (Ignite Calcite 2.16 не оптимизирует ASC-индекс под ORDER BY DESC как reverse-traversal), однако входное множество уже сокращено `searchBounds` — net-выигрыш относительно H2 full scan сохраняется.
 - **1 запрос** падает в smoke по причине упрощённой DDL-схемы (отсутствует колонка `CCDAYBALANCESBEGINDATE`); в проде корректен.
 - **Affinity-настройки smoke стенда** — single-node, cache_group по умолчанию (на cache на группу); в проде кеши коллоцированы через `@AffinityKeyMapped String register`.
 

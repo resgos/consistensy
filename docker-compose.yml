@@ -20,6 +20,9 @@ services:
     environment:
       CONFIG_URI: /opt/ignite/apache-ignite/config/ignite.xml
       IGNITE_QUIET: "false"
+      # OPTION_LIBS — копирует libs/optional/<name>/ -> libs/ перед запуском.
+      # ignite-calcite даёт CalciteQueryEngineConfiguration (см. ignite-config-template.xml).
+      OPTION_LIBS: ignite-calcite
     volumes:
       - ./docker/ignite-config-template.xml:/opt/ignite/apache-ignite/config/ignite.xml:ro
     ports:
@@ -31,6 +34,7 @@ services:
     environment:
       CONFIG_URI: /opt/ignite/apache-ignite/config/ignite.xml
       IGNITE_QUIET: "false"
+      OPTION_LIBS: ignite-calcite
     volumes:
       - ./docker/ignite-config-template.xml:/opt/ignite/apache-ignite/config/ignite.xml:ro
     ports:
@@ -42,6 +46,7 @@ services:
     environment:
       CONFIG_URI: /opt/ignite/apache-ignite/config/ignite.xml
       IGNITE_QUIET: "false"
+      OPTION_LIBS: ignite-calcite
     volumes:
       - ./docker/ignite-config-template.xml:/opt/ignite/apache-ignite/config/ignite.xml:ro
     ports:
