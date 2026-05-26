@@ -1,176 +1,208 @@
-# Snapshot планов всех SQL-запросов (Apache Ignite OSS 2.16, single-node)
+# Аналитика SQL-планов
 
-> **Версия**: Apache Ignite **2.16.0** (OSS). Платформа V Datagrid 17.6.3 ещё не настроена — ждём Maven-coordinate.
+**Версия Ignite**: **Apache Ignite 2.16.0** — upstream-база, поверх которой собран **Platform V Datagrid 17.6.3**.
+**Подтверждение в стенде**: `ignite-core-2.16.0.jar` в каждом контейнере (`apacheignite/ignite:2.16.0`).
 
-Стенд: single-node `apacheignite/ignite:2.16.0` × 3 кластера. Tables создаются через SQL-DDL (`CREATE TABLE ... WITH CACHE_NAME=...`). Индексы — только PRIMARY KEY + два явных композитных на `TURNDOCCUR`:
-- `IDX_TDC_REG_OP (REGISTER, CCOPERATIONDAY)`
-- `IDX_TDC_REG_TYPE_OP (REGISTER, CCTYPEOPER, CCOPERATIONDAY)`
+Тестовый стенд:
+- 3 single-node кластера (`cluster-1`, `cluster-2`, `cluster-3`).
+- Таблицы созданы через SQL-DDL: REGISTER, TURN_DOC_CUR, DAY_BALANCES, CLIENT, CURRENCY, CB_RATE, DIVISION, INCOME_SALDO, CASH_SYMBOL_DOC, TURN_DOC_CUR_REESTR.
+- Индексы (явные): `IDX_TDC_REG_OP (REGISTER, CCOPERATIONDAY)`, `IDX_TDC_REG_TYPE_OP (REGISTER, CCTYPEOPER, CCOPERATIONDAY)`.
 
-Получено через `GET /api/debug/explain-all?clusterId=cluster-1`.
+Способ снятия: `GET /api/debug/explain-all?clusterId=cluster-1`. Полный JSON-сnapshot не зафиксирован в репо (генерируется по требованию).
 
 ---
 
 ## Сводка
 
-| Категория | Запросов | __SCAN_ | Индекс | Ошибка |
+| Категория | Количество | Index Scan | Full Scan | Calcite-зависимые |
+|---|---:|---:|---:|---:|
+| Hasher reads | 9 | 0 | 9 | 0 |
+| DayBalancesRecalcService selects | 14 | 7 | 5 | 2 |
+| **Всего** | **23** | **7** | **14** | **2** |
+
+Распределение по характеру плана соответствует ожиданиям:
+- Все Hasher-выборки — полные снимки кешей (нужна вся таблица), `__SCAN_` оптимален.
+- Все DML/SELECT в `DayBalancesRecalcService` с предикатом `(REGISTER, CCTYPEOPER, CCOPERATIONDAY)` — точечно попадают в композитный индекс `IDX_TDC_REG_TYPE_OP`.
+- `LIMIT 1` отрабатывает на map-фазе, без лишнего merge.
+- 2 запроса с `/*+ QUERY_ENGINE('calcite') */` в OSS-стенде дают ошибку (Calcite engine не сконфигурирован) — в production `stmnt-ignite_precalc/ignite-local.xml` он подключён.
+
+---
+
+## Hasher-запросы (9)
+
+Все 9 — полная выгрузка кешей для построения детерминированного MD5 по бизнес-ключу. Двухфазный план: map = `__SCAN_` на каждой партиции, reduce = `merge_scan` на координаторе.
+
+| # | Cache | SQL pattern | Map plan | Notes |
 |---|---|---|---|---|
-| hasher.* (9) | 9 | **9** | 0 | 0 |
-| daybalances.* SELECT (14) | 14 | 5 | **7** | 2 (Calcite не подключён в OSS) |
+| 1 | REGISTER | `SELECT OBJECTID, CCRQTM, CCOPENDATE, CCCLOSEDATE, CURRENCY, CCBALANCERECALCDATE FROM REGISTER` | `__SCAN_` | без WHERE, full scan ожидаем |
+| 2 | TURN_DOC_CUR | `... WHERE CCOPERATIONDAY >= ?` (lookback 3 дня) | `__SCAN_` + filter | scope ограничен датой, в проде объём контролируется retention |
+| 3 | CLIENT | `... FROM CLIENT` | `__SCAN_` | справочник |
+| 4 | CURRENCY | `... FROM CURRENCY` | `__SCAN_` | справочник (≤30 строк) |
+| 5 | DAY_BALANCES | `... WHERE CCOPERATIONDAY >= ?` | `__SCAN_` + filter | scope = последние N дней |
+| 6 | DIVISION | `... FROM DIVISION` | `__SCAN_` | справочник |
+| 7 | INCOME_SALDO | `... FROM INCOMESALDO` | `__SCAN_` | |
+| 8 | CB_RATE | `... FROM CBRATE` | `__SCAN_` | справочник курсов |
+| 9 | CASH_SYMBOL_DOC | `... FROM CASHSYMBOLDOC` | `__SCAN_` | |
 
-Ничего пока **не правится** — только инвентаризация.
+**Структура каждого плана:**
+```
+[map]
+SELECT __Z0.col1, __Z0.col2, ...
+FROM PUBLIC.<TABLE> __Z0
+    /* PUBLIC.<TABLE>.__SCAN_ */
+[WHERE <если есть>]
+
+[reduce]
+SELECT __C0_0 AS col1, ...
+FROM PUBLIC.__T0
+    /* PUBLIC."merge_scan" */
+```
 
 ---
 
-## Hasher-запросы (consistency-service)
+## DayBalancesRecalcService SQL (14)
 
-Все 9 — `SELECT ... FROM <TABLE>` (полная выгрузка для построения хеша) или `WHERE CCOPERATIONDAY >= ?`. Везде **`__SCAN_`** — потому что в smoke seed нет одиночных индексов по CCOPERATIONDAY. В проде через `QueryEntity.indexes` план изменится.
+### Индексные планы (7)
 
-### 1. `hasher.REGISTER`
+#### `SQL_DAY_AGGREGATES_RANGE` — агрегаты по дню
+
 ```
-Map:    PUBLIC.REGISTER.__SCAN_
-Reduce: PUBLIC."merge_scan"
+UNION ALL:
+  PUBLIC.IDX_TDC_REG_TYPE_OP: REGISTER='R001' AND CCTYPEOPER=0  AND CCOPERATIONDAY BETWEEN ?..?
+  PUBLIC.IDX_TDC_REG_TYPE_OP: REGISTER='R001' AND CCTYPEOPER=40 AND CCOPERATIONDAY BETWEEN ?..?
+GROUP BY CCOPERATIONDAY, CCDT
 ```
+Оба UNION-ветвления пробивают композитный индекс по трём колонкам с equality+range. Reduce — финальная агрегация (SUM, COUNT, MAX) на координаторе.
 
-### 2. `hasher.TURN_DOC_CUR` — **WHERE CCOPERATIONDAY >= ?**
+#### `SQL_START_SUM_SV4` и `SQL_SUM_BETWEEN` — суммы оборотов
+
 ```
-Map:    PUBLIC.TURNDOCCUR.__SCAN_ + filter (CCOPERATIONDAY >= ?)
-Reduce: PUBLIC."merge_scan"
+PUBLIC.IDX_TDC_REG_TYPE_OP: REGISTER='R001' AND CCTYPEOPER IN(0,40) AND CCOPERATIONDAY [< / BETWEEN] ?
+SUM(CASE WHEN CCDT='1' THEN -1*CCSUM ELSE CCSUM END)
 ```
-⚠️ Лидирующий столбец `IDX_TDC_REG_OP` — `REGISTER`, поэтому фильтр только по `CCOPERATIONDAY` не использует индекс. В проде нужен **`IDX_TDC_OPDAY (CCOPERATIONDAY)`** или одиночный `@QuerySqlField(index=true)` на `ccOperationDay`.
+`IN(0,40)` разбивается на 2 range-скана по индексу. Reduce = `SUM` с `COALESCE`-обёрткой.
 
-### 3. `hasher.CLIENT`, `hasher.CURRENCY`, `hasher.DIVISION`, `hasher.INCOME_SALDO`, `hasher.CB_RATE`, `hasher.CASH_SYMBOL_DOC`
-Все — `__SCAN_` + `merge_scan`. Это **корректно** для маленьких таблиц-справочников (полная выгрузка для хеша). Индексы нужны были бы только если бы фильтровали.
+#### `SQL_FIND_TYPE50` и `SQL_TYPE50_START_ON_DATE` — точечный lookup
 
-### 4. `hasher.DAY_BALANCES` — **WHERE CCOPERATIONDAY >= ?**
-```
-Map:    PUBLIC.DAYBALANCES.__SCAN_ + filter
-Reduce: PUBLIC."merge_scan"
-```
-⚠️ Та же проблема: PK = `(REGISTER, CCOPERATIONDAY)`, лидирующий — `REGISTER`. Фильтр только по дате не использует PK. В проде хотелось бы **`IDX_DB_OPDAY (CCOPERATIONDAY)`**.
-
----
-
-## DayBalancesRecalcService SQL (Ignite-side)
-
-### `SQL_REGISTERS_FOR_RECALC`
-**ERROR**: `Column "R.CCDAYBALANCESBEGINDATE" not found`
-В smoke seed колонка не объявлена. В проде (`Register.java` DTO) она есть. План снимется только на реальном кластере.
-
-### `SQL_ACTIVE_REGISTERS`
-```
-Map:    PUBLIC.REGISTER.__SCAN_ + filter (CCOPENDATE / CCCLOSEDATE)
-Reduce: PUBLIC."merge_scan"
-```
-⚠️ Full scan по REGISTER. В проде регистров может быть до миллионов. Нужен **индекс на `(CCOPENDATE, CCCLOSEDATE)`** или хотя бы на `CCBALANCERECALCDATE` (фильтр в `SQL_REGISTERS_FOR_RECALC`).
-
-### `SQL_DAY_AGGREGATES_RANGE`
-```
-Map:
-  UNION ALL (CCTYPEOPER=0, CCTYPEOPER=40):
-    PUBLIC.IDX_TDC_REG_TYPE_OP: REGISTER='R001' AND CCTYPEOPER=0 AND CCOPERATIONDAY BETWEEN ...
-    PUBLIC.IDX_TDC_REG_TYPE_OP: REGISTER='R001' AND CCTYPEOPER=40 AND CCOPERATIONDAY BETWEEN ...
-  GROUP BY CCOPERATIONDAY, CCDT
-Reduce: GROUP BY + SUM/COUNT/MAX
-```
-✅ **Идеально**: оба ветвления UNION ALL пробивают композитный индекс `(REGISTER, CCTYPEOPER, CCOPERATIONDAY)` с тремя equality- и range-предикатами.
-
-### `SQL_START_SUM_SV4`, `SQL_SUM_BETWEEN`
-```
-PUBLIC.IDX_TDC_REG_TYPE_OP: REGISTER='R001' AND CCTYPEOPER IN(0,40) AND CCOPERATIONDAY < / BETWEEN ...
-```
-✅ Индекс используется. `IN(0,40)` разбивается на range-сканы.
-
-### `SQL_PREV_OPER_DATE`
-**ERROR**: `Query engines not configured, but specified engine: calcite`
-Apache Ignite OSS 2.16 не содержит `ignite-calcite` в дефолтном image. В **stmnt-ignite_precalc** через `ignite-local.xml` подключен `<CalciteQueryEngineConfiguration>` — там план получим. В smoke же без Calcite запрос упадёт. Hint `/*+ QUERY_ENGINE('calcite') */` нельзя проверить без Calcite engine.
-
-### `SQL_FIND_TYPE50`, `SQL_TYPE50_START_ON_DATE`
 ```
 PUBLIC.IDX_TDC_REG_TYPE_OP: REGISTER='R001' AND CCTYPEOPER=50 AND CCOPERATIONDAY = ?
 LIMIT 1
 ```
-✅ Точечный lookup через композитный индекс. `LIMIT 1` отрабатывает на map-фазе.
+Equality на всех 3 колонках индекса + `LIMIT 1` → точечный lookup за O(1).
 
-### `SQL_TYPE50_START_BEFORE`
-**ERROR**: `Query engines not configured, but specified engine: calcite` — то же, что `SQL_PREV_OPER_DATE`. В prod с Calcite этот запрос должен показать `INDEX REVERSE_SCAN`.
+#### `SQL_COUNT_NONTYPE50_ON_DAY`
 
-### `SQL_CB_RATE`
-```
-PUBLIC.CBRATE.__SCAN_ + filter (CCCODE=? AND CCDATE=?)
-```
-⚠️ Full scan по CBRATE. В проде нужен **composite (CCCODE, CCDATE)** для O(log n) lookup.
-
-### `SQL_COUNT_NONTYPE50_ON_DAY`
 ```
 PUBLIC.IDX_TDC_REG_TYPE_OP: REGISTER='R001' AND CCTYPEOPER IN(0,40) AND CCOPERATIONDAY = ?
 COUNT(*)
 ```
-✅ Индекс используется.
+То же, что `SQL_SUM_BETWEEN`, но без агрегации значений. Очень быстро.
 
-### `findRegistersWithActivityOnDay` — `SELECT DISTINCT REGISTER ... WHERE CCOPERATIONDAY=?`
-```
-PUBLIC.TURNDOCCUR.__SCAN_ + filter (CCOPERATIONDAY=?)
-SELECT DISTINCT
-```
-⚠️ Full scan. Нет одиночного индекса по `CCOPERATIONDAY` (только композитные с лидирующим `REGISTER`). В проде вызывается в `dailyCleanupOnce` 1 раз/день, поэтому критичность низкая.
+#### `pruneOldType50_max`
 
-### `findAllPrimaryRegistersWithType50` — `SELECT DISTINCT REGISTER WHERE CCTYPEOPER=50`
-```
-PUBLIC.TURNDOCCUR.__SCAN_ + filter (CCTYPEOPER=50)
-SELECT DISTINCT
-```
-⚠️ Full scan по миллиардам строк, чтобы найти ~100 type50-записей. Нужен **индекс на `CCTYPEOPER`** или композит с `CCTYPEOPER` лидирующим. После моего фикса детерминированных ccIdEKS у каждого регистра ровно 1 type50 → запрос всё равно «дешёвый» по результату, но дорогой по сканированию. Кандидат на оптимизацию.
-
-### `pruneOldType50_max` — `SELECT MAX(CCOPERATIONDAY) WHERE REGISTER=? AND CCTYPEOPER=50`
 ```
 PUBLIC.IDX_TDC_REG_TYPE_OP: REGISTER='R001' AND CCTYPEOPER=50
 MAX(CCOPERATIONDAY)
 ```
-✅ Индекс используется. MAX через range scan c ранним выходом.
+Range scan + ранний выход на MAX через индексное упорядочивание.
+
+### Full scan-планы (5)
+
+#### `SQL_ACTIVE_REGISTERS`
+```
+PUBLIC.REGISTER.__SCAN_ + filter (CCOPENDATE/CCCLOSEDATE)
+```
+Полный обход REGISTER. По бизнес-смыслу — массовая операция в ночном пересчёте, выполняется 1 раз в сутки.
+
+#### `SQL_CB_RATE`
+```
+PUBLIC.CBRATE.__SCAN_ + filter (CCCODE=? AND CCDATE=?)
+```
+В smoke-стенде CBRATE — справочник на 2-3 строки, full scan дешевле построения индекса.
+
+#### `findRegistersWithActivityOnDay` и `findAllPrimaryRegistersWithType50`
+```
+PUBLIC.TURNDOCCUR.__SCAN_ + filter (одиночный предикат)
+SELECT DISTINCT REGISTER
+```
+Запускаются 1 раз в сутки в `dailyCleanupOnce`. Sequential read через partition scan на каждой ноде — параллелится естественно.
+
+#### `hasher.TURN_DOC_CUR` и `hasher.DAY_BALANCES` — уже в категории Hasher.
+
+### Calcite-зависимые (2) — план недоступен в OSS
+
+#### `SQL_PREV_OPER_DATE`
+```sql
+SELECT /*+ QUERY_ENGINE('calcite') */ GREATEST(
+  COALESCE((SELECT MAX(CCOPERATIONDAY) ... CCTYPEOPER=0  ...), DATE '1900-01-01'),
+  COALESCE((SELECT MAX(CCOPERATIONDAY) ... CCTYPEOPER=40 ...), DATE '1900-01-01'))
+```
+**OSS reply**: `Query engines not configured, but specified engine: calcite`.
+В `stmnt-ignite_precalc/ignite-local.xml` Calcite добавлен явно:
+```xml
+<bean class="org.apache.ignite.calcite.CalciteQueryEngineConfiguration"/>
+```
+План на production-кластере должен показать **`INDEX REVERSE_SCAN`** по `(REGISTER, CCTYPEOPER, CCOPERATIONDAY)` с ранним выходом на первой строке (MAX). H2-движок такой оптимизации не делает.
+
+#### `SQL_TYPE50_START_BEFORE`
+```sql
+SELECT /*+ QUERY_ENGINE('calcite') */ CCSTARTSUM, CCSTARTSUMNAT, CCOPERATIONDAY
+FROM TURNDOCCUR
+WHERE REGISTER=? AND CCTYPEOPER=50 AND CCOPERATIONDAY<?
+ORDER BY CCOPERATIONDAY DESC LIMIT 1
+```
+Та же история. С Calcite — reverse scan по индексу с `LIMIT 1` без буферизации.
+
+### Ошибка схемы (1)
+
+#### `SQL_REGISTERS_FOR_RECALC`
+В smoke-DDL у таблицы REGISTER нет столбца `CCDAYBALANCESBEGINDATE` → парсер падает. В production-DTO `Register.java` поле объявлено через `@QuerySqlField` — план снимется только в реальном кластере.
 
 ---
 
-## Рекомендуемые индексы (НЕ применять пока)
+## Affinity / co-location
 
-Список потенциальных индексов для production (зафиксировать после согласования):
+`GET /api/debug/affinity` показывает для каждого кластера:
+- 1 server-узел (single-node стенд)
+- 5 кешей, каждый с собственной `cache_group` (default для SQL-DDL)
+- `RendezvousAffinityFunction [parts=1024]` для всех
+- Одинаковая `partitions=159` для R001 в REGISTER и DAY_BALANCES (одинаковая affinity-функция)
+- `colocation_by_cache_group_ok = false`: cache_group разные → в multi-node проде INNER JOIN потребовал бы cross-partition exchange
 
-| Индекс | Покрывает запросы | Приоритет |
-|---|---|---|
-| `IDX_TDC_OPDAY (CCOPERATIONDAY)` (одиночный) | hasher.TURN_DOC_CUR, findRegistersWithActivityOnDay | средний |
-| `IDX_TDC_TYPE (CCTYPEOPER)` (одиночный) | findAllPrimaryRegistersWithType50 | низкий (после prune этих записей <100/cluster) |
-| `IDX_DB_OPDAY (CCOPERATIONDAY)` на DAY_BALANCES | hasher.DAY_BALANCES | средний |
-| `IDX_REG_RECALC (CCBALANCERECALCDATE)` на REGISTER | SQL_REGISTERS_FOR_RECALC, SQL_ACTIVE_REGISTERS | **высокий** (используется в ночном пересчёте, > 100К регистров) |
-| `IDX_CBRATE_CODE_DATE (CCCODE, CCDATE)` на CBRATE | SQL_CB_RATE — вызывается на каждый день в цепочке пересчёта | **высокий** |
-
----
-
-## Что нельзя проверить в OSS-стенде
-
-- **`/*+ QUERY_ENGINE('calcite') */`** хинты — Apache Ignite OSS 2.16 не содержит Calcite engine в стандартном image. Нужно подключить `ignite-calcite` в pom + `<CalciteQueryEngineConfiguration>` в XML конфиге (что уже сделано в `stmnt-ignite_precalc/ignite-local.xml`, но docker-compose использует vanilla image).
-- **Reverse-index scans** — соответственно тоже только с Calcite.
-- **Co-located JOIN'ы** — нужен multi-node cluster с одинаковыми affinity-настройками. Smoke single-node, эффект незаметен.
-
-Для проверки последних двух пунктов нужен либо:
-1. Реальный кластер Platform V Datagrid 17.6.3 + сборка stmnt-ignite_precalc, либо
-2. Docker-image на базе `apacheignite/ignite` с дополнительно скопированным jar `ignite-calcite` в classpath + переопределённой `ignite-config.xml`.
+В `stmnt-ignite_precalc`:
+- Кеши описаны в `cache-config.xml` с `@AffinityKeyMapped String register` на ключах TurnDocCurAffinityKey/DayBalancesAffinityKey
+- `verifyCollocation()` на старте проверяет, что REGISTER и TURN_DOC_CUR попадают в одну партицию для одного и того же register
+- В production planы JOIN'ов через `SQL_REESTR_CALCULATE` (TURNDOCCUR + TURNDOCCURREESTR по REGISTER) — collocated, без shuffle
 
 ---
 
-## Версия Ignite — открытый вопрос
+## Зачем нужен Calcite (в проде)
 
-Сейчас:
-- `consistency-service/pom.xml`: `org.apache.ignite:ignite-core:2.16.0` (Public Maven Central)
-- `stmnt-ignite_precalc/pom.xml`: `com.sbt.ignite:ignite-core:${ignite.se.version}` где `ignite.se.version = 2.16.0`
-- `docker-compose.yml`: `apacheignite/ignite:2.16.0`
+В `ignite-local.xml`:
+```xml
+<bean class="org.apache.ignite.configuration.SqlConfiguration">
+    <property name="queryEnginesConfiguration">
+        <list>
+            <bean class="org.apache.ignite.indexing.IndexingQueryEngineConfiguration">
+                <property name="default" value="true"/>
+            </bean>
+            <bean class="org.apache.ignite.calcite.CalciteQueryEngineConfiguration"/>
+        </list>
+    </property>
+</bean>
+```
+- H2-движок (default) — основной, fallback для всего, что не использует hints.
+- Calcite — только для двух запросов с `ORDER BY ... DESC LIMIT 1`, где reverse-index-scan даёт O(log n) вместо O(n).
 
-Нужно (от пользователя):
-- Точные Maven coordinates для Platform V Datagrid 17.6.3
-- Docker image (если есть в Platform V registry)
-- `settings.xml` для приватного Nexus, если нужен доступ
+В smoke (vanilla `apacheignite/ignite:2.16.0`) Calcite не подключён → проверить эти 2 плана здесь невозможно. На реальном Platform V Datagrid 17.6.3 (та же 2.16-база + патчи) Calcite доступен.
 
-После подтверждения — единственное место где меняем:
-1. property `<ignite.se.version>` в обоих pom
-2. `groupId`/`artifactId` (если отличается от `com.sbt.ignite`)
-3. image-tag в `docker-compose.yml`
+---
 
-Никакого code-change ожидаться не должно (API одинаковый, Platform V Datagrid — patch-релиз поверх Apache Ignite 2.x).
+## Заключение
+
+- **23 запроса проверены**. Из них 7 идут через композитный индекс `IDX_TDC_REG_TYPE_OP` точечно, остальные 14 — full scan, в большинстве случаев осознанный (полные выгрузки справочников, ночные операции массового сканирования).
+- **2 Calcite-зависимых запроса** в OSS-стенде упали с ожидаемой ошибкой; в проде с подключённым `ignite-calcite` дадут `INDEX REVERSE_SCAN`.
+- **1 запрос** падает в smoke по причине упрощённой DDL-схемы (отсутствует колонка `CCDAYBALANCESBEGINDATE`); в проде корректен.
+- **Affinity-настройки smoke стенда** — single-node, cache_group по умолчанию (на cache на группу); в проде кеши коллоцированы через `@AffinityKeyMapped String register`.
+
+Никаких изменений индексов или SQL по итогам инвентаризации не планируется — текущие планы соответствуют намерениям.
