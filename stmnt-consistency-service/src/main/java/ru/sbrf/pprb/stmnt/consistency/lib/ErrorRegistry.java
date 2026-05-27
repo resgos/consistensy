@@ -5,8 +5,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
+import ru.sbrf.pprb.stmnt.consistency.lib.events.DomainEvents;
+import ru.sbrf.pprb.stmnt.consistency.lib.events.EventPublisher;
 import ru.sbrf.pprb.stmnt.consistency.lib.repo.ErrorRepository;
 
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -28,6 +31,7 @@ public class ErrorRegistry {
 
     private final ErrorRepository repo;
     private final ObjectMapper mapper;
+    private final EventPublisher events;
 
     public void record(String source, String level, String code, String message,
                        Map<String, Object> details) {
@@ -46,6 +50,16 @@ public class ErrorRegistry {
             }
         }
         repo.insert(source, level, code, message, json, relatedRunId, clusterId, cacheName);
+        // Spring-event → Kafka (через KafkaEventListener). Не валим запись если publisher
+        // упал — это лог-метрики, не транзакционная история.
+        try {
+            events.publish(new DomainEvents.ErrorRecorded(
+                    source, level, code, message, details,
+                    relatedRunId, clusterId, cacheName, Instant.now()));
+        } catch (Exception e) {
+            log.warn("ErrorRegistry: event publish failed (source={}, code={}): {}",
+                    source, code, e.toString());
+        }
     }
 
     public void error(String source, String code, String message,

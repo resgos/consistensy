@@ -17,6 +17,13 @@
 
     <dependencies>
 
+        <!-- Shared canonical-hash правила + контракт CdcEvent (используется и Ignite-lib) -->
+        <dependency>
+            <groupId>ru.sbrf.pprb.stmnt.services</groupId>
+            <artifactId>stmnt-consistency-hashers</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
@@ -54,6 +61,12 @@
             <groupId>org.apache.ignite</groupId>
             <artifactId>ignite-core</artifactId>
             <version>${ignite.version}</version>
+        </dependency>
+
+        <!-- Kafka producer (for outgoing domain events) -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
         </dependency>
 
         <!-- Metrics (prometheus) -->

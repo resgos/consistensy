@@ -11,10 +11,13 @@
   Caches are auto-created via SQL DDL by /api/debug/seed.
 -->
 <beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:util="http://www.springframework.org/schema/util"
        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
        xsi:schemaLocation="
             http://www.springframework.org/schema/beans
-            http://www.springframework.org/schema/beans/spring-beans.xsd">
+            http://www.springframework.org/schema/beans/spring-beans.xsd
+            http://www.springframework.org/schema/util
+            http://www.springframework.org/schema/util/spring-util.xsd">
 
     <bean id="ignite.cfg" class="org.apache.ignite.configuration.IgniteConfiguration">
 
@@ -23,6 +26,47 @@
                 <property name="host" value="0.0.0.0"/>
                 <property name="port" value="10800"/>
             </bean>
+        </property>
+
+        <!--
+          Включаем cache-события для CDC publisher'а. Без этого
+          ignite.events().localListen(EVT_CACHE_OBJECT_PUT/REMOVED) ничего не получит.
+          Поведение: события генерятся на любую запись в cache —
+          cache.put(), cache.putAll(), cache.remove(), cache.invoke(),
+          SQL INSERT/UPDATE/DELETE через H2/Calcite, DataStreamer.
+          ContinuousQuery в Apache Ignite 2.16 имеет известную регрессию с
+          SQL DML (IGNITE-9586) — поэтому CDC использует IgniteEvents.
+        -->
+        <property name="includeEventTypes">
+            <list>
+                <util:constant static-field="org.apache.ignite.events.EventType.EVT_CACHE_OBJECT_PUT"/>
+                <util:constant static-field="org.apache.ignite.events.EventType.EVT_CACHE_OBJECT_REMOVED"/>
+            </list>
+        </property>
+
+        <!--
+          CDC publisher: на каждое изменение интересующих кешей шлёт
+          {clusterId, cache, key, hash, op, ts} в Kafka. Cluster-id,
+          bootstrap, topic-prefix — через system properties (см.
+          docker-compose JVM_OPTS).
+
+          В smoke-стенде каши создаются через DDL (CREATE TABLE), их
+          физические имена = SQL_REGISTER_REGISTER и т.д. Publisher
+          использует fuzzy matching: для logical "REGISTER" ищет
+          REGISTER -> SQL_REGISTER_REGISTER -> SQL_PUBLIC_REGISTER.
+        -->
+        <property name="lifecycleBeans">
+            <list>
+                <bean class="ru.sbrf.stmnt.ignite.kafka.cdc.KafkaCdcPublisherBean">
+                    <property name="enabled"          value="#{systemProperties['consistency.cdc.enabled']         ?: 'true'}"/>
+                    <property name="bootstrapServers" value="#{systemProperties['consistency.cdc.kafka-bootstrap'] ?: 'kafka:9092'}"/>
+                    <property name="clusterId"        value="#{systemProperties['consistency.cdc.cluster-id']      ?: 'cluster-1'}"/>
+                    <property name="topicPrefix"      value="#{systemProperties['consistency.cdc.topic-prefix']    ?: 'stmnt-consistency'}"/>
+                    <property name="hashers">
+                        <bean class="ru.sbrf.stmnt.ignite.kafka.cdc.IgniteCdcHashers" factory-method="all"/>
+                    </property>
+                </bean>
+            </list>
         </property>
 
         <!-- SQL ENGINES: H2 default + Calcite for QUERY_ENGINE('calcite') hints -->
@@ -41,15 +85,20 @@
             </bean>
         </property>
 
+        <!--
+          Discovery addresses передаются через системное свойство
+          ignite.discovery.addresses (см. docker-compose JVM_OPTS) как
+          comma-separated list. Узлы одного кластера должны иметь ОДИНАКОВЫЙ
+          список — иначе они образуют независимые мини-кластеры.
+          Default ("127.0.0.1:47500") — single-node режим.
+        -->
         <property name="discoverySpi">
             <bean class="org.apache.ignite.spi.discovery.tcp.TcpDiscoverySpi">
                 <property name="ipFinder">
                     <bean class="org.apache.ignite.spi.discovery.tcp.ipfinder.vm.TcpDiscoveryVmIpFinder">
-                        <property name="addresses">
-                            <list>
-                                <value>127.0.0.1:47500</value>
-                            </list>
-                        </property>
+                        <!-- commaDelimitedListToSet возвращает Set<String> — Ignite.setAddresses(Collection) принимает. -->
+                        <property name="addresses"
+                                  value="#{T(org.springframework.util.StringUtils).commaDelimitedListToSet(systemProperties['ignite.discovery.addresses'] ?: '127.0.0.1:47500')}"/>
                     </bean>
                 </property>
             </bean>

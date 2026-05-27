@@ -535,11 +535,10 @@ public class DebugSeedController {
     // -------- internals -------------------------------------------------------
 
     private void seedOne(IgniteClient client, String currencyForR001) {
-        // Drop legacy tables (no-op if absent)
-        for (String t : List.of("REGISTER", "CURRENCY", "DAYBALANCES", "CLIENT", "CBRATE",
-                "TURNDOCCUR", "DIVISION", "INCOMESALDO", "CASHSYMBOLDOC", "TURNDOCCURREESTR")) {
-            try { exec(client, "DROP TABLE IF EXISTS PUBLIC." + t); } catch (Exception ignored) {}
-        }
+        // ВАЖНО: НЕ DROP TABLE. DROP убивает Ignite-cache → ContinuousQuery
+        // публишера инвалидируется и больше не получает events. Используем
+        // CREATE TABLE IF NOT EXISTS + DELETE FROM (тогда cache живёт между
+        // вызовами /seed, CQ остаётся прикреплён).
 
         // ---- REGISTER ----
         exec(client,

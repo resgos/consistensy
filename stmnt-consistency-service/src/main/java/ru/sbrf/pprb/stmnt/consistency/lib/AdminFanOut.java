@@ -6,9 +6,12 @@ import org.apache.ignite.client.IgniteClient;
 import org.springframework.stereotype.Component;
 import ru.sbrf.pprb.stmnt.consistency.config.ConsistencyProperties;
 import ru.sbrf.pprb.stmnt.consistency.integration.ignite.IgniteClientFactory;
+import ru.sbrf.pprb.stmnt.consistency.lib.events.DomainEvents;
+import ru.sbrf.pprb.stmnt.consistency.lib.events.EventPublisher;
 import ru.sbrf.stmnt.ignite.service.DayBalancesAdminService;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -31,6 +34,7 @@ public class AdminFanOut {
     private final IgniteClientFactory clientFactory;
     private final ConsistencyProperties props;
     private final ErrorRegistry errors;
+    private final EventPublisher events;
 
     private static final String SERVICE_NAME = "DayBalancesAdmin";
 
@@ -47,7 +51,7 @@ public class AdminFanOut {
                                                   BigDecimal opening,
                                                   BigDecimal openingNat,
                                                   List<String> clusterIds) {
-        return fanOut(clusterIds, "init", admin ->
+        return fanOut(clusterIds, "init", registerId, admin ->
                 admin.initRegister(registerId, fromDate, toDate, opening, openingNat));
     }
 
@@ -55,7 +59,7 @@ public class AdminFanOut {
     public Map<String, Map<String, Object>> cleanup(String beforeDate,
                                                      String registerFilter,
                                                      List<String> clusterIds) {
-        return fanOut(clusterIds, "cleanup", admin ->
+        return fanOut(clusterIds, "cleanup", registerFilter, admin ->
                 admin.cleanupBalances(beforeDate, registerFilter));
     }
 
@@ -64,7 +68,7 @@ public class AdminFanOut {
                                                     String fromDate,
                                                     String toDate,
                                                     List<String> clusterIds) {
-        return fanOut(clusterIds, "recalc", admin -> {
+        return fanOut(clusterIds, "recalc", registerId, admin -> {
             admin.recalcRegisterRange(registerId, fromDate, toDate);
             return "ok";
         });
@@ -79,6 +83,7 @@ public class AdminFanOut {
 
     private Map<String, Map<String, Object>> fanOut(List<String> clusterIds,
                                                      String opName,
+                                                     String registerId,
                                                      AdminCall call) {
         List<String> targets = (clusterIds == null || clusterIds.isEmpty())
                 ? props.getClusters().stream()
@@ -92,6 +97,14 @@ public class AdminFanOut {
         }
         Map<String, Map<String, Object>> result = new LinkedHashMap<>();
         for (var e : futures.entrySet()) result.put(e.getKey(), e.getValue().join());
+
+        // Финальный domain-event — fan-out завершён по всем кластерам.
+        try {
+            events.publish(new DomainEvents.AdminOperationCompleted(
+                    opName, registerId, targets, result, Instant.now()));
+        } catch (Exception ex) {
+            log.warn("AdminFanOut: event publish failed (op={}): {}", opName, ex.toString());
+        }
         return result;
     }
 

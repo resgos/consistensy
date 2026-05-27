@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Shared module: канонические правила хеширования полей DTO + контракт CDC-события.
+  Используется ОБЕИМИ сторонами:
+    - stmnt-ignite-lib       (producer: считает hash в ContinuousQuery callback)
+    - stmnt-consistency-service (consumer: десериализует Kafka-сообщения, UPSERT в PG)
+  Единая правда о canonical-форме поля → одинаковый hash на обеих сторонах.
+
+  Target = Java 11 чтобы Ignite-lib (Java 11) мог использовать.
+  Никаких Spring/Boot/Jackson-зависимостей с runtime-классами — только plain Java.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                             http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>ru.sbrf.pprb.stmnt.services</groupId>
+        <artifactId>stmnt-consistency</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>stmnt-consistency-hashers</artifactId>
+    <packaging>jar</packaging>
+
+    <properties>
+        <!-- override: jar должен потребляться apacheignite/ignite:2.16.0 docker-образом,
+             который собран на Java 8. Bytecode v52 совместим со всеми более новыми JVM. -->
+        <maven.compiler.source>1.8</maven.compiler.source>
+        <maven.compiler.target>1.8</maven.compiler.target>
+        <maven.compiler.release>8</maven.compiler.release>
+    </properties>
+
+    <dependencies>
+        <!-- Jackson только compile-scope для @JsonProperty аннотаций на CdcEvent.
+             Сериализацию делает каждая сторона своим mapper'ом (Spring или Ignite). -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-annotations</artifactId>
+        </dependency>
+    </dependencies>
+</project>

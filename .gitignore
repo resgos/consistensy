@@ -1,7 +1,5 @@
 target/
-*.class
+.claude/worktrees/
 .idea/
 *.iml
-.vscode/
-.DS_Store
-*.log
+*.class

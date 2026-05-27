@@ -2,14 +2,19 @@ package ru.sbrf.pprb.stmnt.consistency.lib;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import ru.sbrf.pprb.stmnt.consistency.config.ConsistencyProperties;
+import ru.sbrf.pprb.stmnt.consistency.lib.events.DomainEvents;
+import ru.sbrf.pprb.stmnt.consistency.lib.events.EventPublisher;
 import ru.sbrf.pprb.stmnt.consistency.lib.hash.HashCalculator;
 import ru.sbrf.pprb.stmnt.consistency.lib.hash.Hashers;
 import ru.sbrf.pprb.stmnt.consistency.lib.repo.ConsistencyRunRepository;
 import ru.sbrf.pprb.stmnt.consistency.lib.repo.HashRepository;
 import ru.sbrf.pprb.stmnt.consistency.lib.repo.MismatchRepository;
+
+import java.time.Instant;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -22,14 +27,23 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Orchestrates consistency runs:
- *  - for each cache, reads hashes from all clusters in parallel
- *  - detects mismatches and persists everything to PG
+ * PULL-MODE consistency runs (legacy):
+ *  - читает hash'и через thin-client SQL из всех кластеров параллельно
+ *  - детектирует mismatch'и и пишет в PG.
  *
- * Trigger: hourly cron + REST-initiated ad-hoc.
+ * Используется только когда consistency.pull-mode=true. В CDC-режиме
+ * (consistency.cdc.enabled=true) этим занимается {@link
+ * ru.sbrf.pprb.stmnt.consistency.lib.cdc.ConsistencySweepJob}, который
+ * читает уже подготовленный consumer'ом snapshot из PG. Pull остаётся как:
+ *   - fallback на случай проблем с Kafka producer'ами в Ignite-кластерах
+ *   - bootstrap-инструмент (заполнить consistency_hash_latest до первого CDC-события)
+ *   - ручной replay через REST.
+ *
+ * Trigger: hourly cron (если pull-mode=true) + REST-initiated ad-hoc.
  */
 @Slf4j
 @Service
+@ConditionalOnProperty(name = "consistency.pull-mode", havingValue = "true")
 @RequiredArgsConstructor
 public class ConsistencyJob {
 
@@ -40,6 +54,7 @@ public class ConsistencyJob {
     private final MismatchRepository mismatches;
     private final Hashers hashers;
     private final ErrorRegistry errors;
+    private final EventPublisher events;
 
     public static final String MISSING = "MISSING";
 
@@ -63,6 +78,7 @@ public class ConsistencyJob {
      */
     public long runAll(String onlyCache) {
         long runId = runs.createRunning(onlyCache);
+        events.publish(new DomainEvents.RunStarted(runId, onlyCache, Instant.now()));
         int totalMismatches = 0;
         String status = "OK";
         String error = null;
@@ -91,6 +107,8 @@ public class ConsistencyJob {
                     java.util.Map.of("runId", runId, "cache", String.valueOf(onlyCache)));
         } finally {
             runs.markFinished(runId, status, totalMismatches, error);
+            events.publish(new DomainEvents.RunFinished(
+                    runId, status, totalMismatches, error, Instant.now()));
             log.info("Run {} done: status={} mismatches={}", runId, status, totalMismatches);
         }
         return runId;
@@ -145,6 +163,13 @@ public class ConsistencyJob {
                             "examples", detected.stream().limit(3)
                                     .map(MismatchRepository.Mismatch::businessKey).toList()),
                     runId, null, h.cacheName());
+            // Эмитим Spring-event на каждый mismatch — KafkaEventListener подхватит и отправит наружу.
+            Instant detectedAt = Instant.now();
+            for (MismatchRepository.Mismatch mm : detected) {
+                events.publish(new DomainEvents.MismatchDetected(
+                        runId, h.cacheName(), mm.businessKey(),
+                        mm.clusterHashes(), detectedAt));
+            }
         }
         log.info("Run {} cache {} mismatches={}", runId, h.cacheName(), detected.size());
         return detected.size();

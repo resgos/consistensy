@@ -49,6 +49,17 @@ public class ConsistencyProperties {
      */
     private boolean debugExplainPlans = false;
 
+    /** Kafka event publishing настройки. */
+    private Events events = new Events();
+
+    @Data
+    public static class Events {
+        /** Publish domain events to Kafka (in addition to Spring in-process). */
+        private boolean kafkaEnabled = false;
+        /** Prefix for topic names: prefix + "." + entity + "." + event. */
+        private String topicPrefix = "stmnt-consistency";
+    }
+
     @Data
     public static class Cluster {
         /** Logical id, e.g. "cluster-1". */

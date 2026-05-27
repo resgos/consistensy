@@ -14,43 +14,67 @@ version: "3.9"
 
 services:
 
+  # ========================================================================
+  # 1 кластер cluster-1 × 3 узла (ignite-1, ignite-1b, ignite-1c)
+  # Все 3 узла видят друг друга через общий discovery list — один topology.
+  # @AffinityKeyMapped("register") распределяет partition'ы между 3 узлами.
+  # При query на multi-IN: MAP-фаза идёт параллельно на 3 узлах, REDUCE merge.
+  # ========================================================================
+
   ignite-1:
-    image: apacheignite/ignite:2.16.0
+    build:
+      context: .
+      dockerfile: docker/ignite-cdc.Dockerfile
+    image: stmnt-ignite-cdc:2.16.0
     container_name: ignite-1
+    depends_on:
+      kafka:
+        condition: service_healthy
     environment:
       CONFIG_URI: /opt/ignite/apache-ignite/config/ignite.xml
       IGNITE_QUIET: "false"
-      # OPTION_LIBS — копирует libs/optional/<name>/ -> libs/ перед запуском.
-      # ignite-calcite даёт CalciteQueryEngineConfiguration (см. ignite-config-template.xml).
       OPTION_LIBS: ignite-calcite
+      JVM_OPTS: "-Dconsistency.cdc.cluster-id=cluster-1 -Dconsistency.cdc.kafka-bootstrap=kafka:9092 -Dignite.discovery.addresses=ignite-1:47500,ignite-1b:47500,ignite-1c:47500"
     volumes:
       - ./docker/ignite-config-template.xml:/opt/ignite/apache-ignite/config/ignite.xml:ro
     ports:
       - "10801:10800"
 
-  ignite-2:
-    image: apacheignite/ignite:2.16.0
-    container_name: ignite-2
+  ignite-1b:
+    image: stmnt-ignite-cdc:2.16.0
+    container_name: ignite-1b
+    depends_on:
+      kafka:
+        condition: service_healthy
+      ignite-1:
+        condition: service_started
     environment:
       CONFIG_URI: /opt/ignite/apache-ignite/config/ignite.xml
       IGNITE_QUIET: "false"
       OPTION_LIBS: ignite-calcite
+      JVM_OPTS: "-Dconsistency.cdc.cluster-id=cluster-1 -Dconsistency.cdc.kafka-bootstrap=kafka:9092 -Dignite.discovery.addresses=ignite-1:47500,ignite-1b:47500,ignite-1c:47500"
     volumes:
       - ./docker/ignite-config-template.xml:/opt/ignite/apache-ignite/config/ignite.xml:ro
     ports:
-      - "10802:10800"
+      - "10811:10800"
 
-  ignite-3:
-    image: apacheignite/ignite:2.16.0
-    container_name: ignite-3
+  ignite-1c:
+    image: stmnt-ignite-cdc:2.16.0
+    container_name: ignite-1c
+    depends_on:
+      kafka:
+        condition: service_healthy
+      ignite-1:
+        condition: service_started
     environment:
       CONFIG_URI: /opt/ignite/apache-ignite/config/ignite.xml
       IGNITE_QUIET: "false"
       OPTION_LIBS: ignite-calcite
+      JVM_OPTS: "-Dconsistency.cdc.cluster-id=cluster-1 -Dconsistency.cdc.kafka-bootstrap=kafka:9092 -Dignite.discovery.addresses=ignite-1:47500,ignite-1b:47500,ignite-1c:47500"
     volumes:
       - ./docker/ignite-config-template.xml:/opt/ignite/apache-ignite/config/ignite.xml:ro
     ports:
-      - "10803:10800"
+      - "10821:10800"
 
   postgres:
     image: postgres:16-alpine
@@ -60,11 +84,38 @@ services:
       POSTGRES_USER: consistency
       POSTGRES_PASSWORD: consistency
     ports:
-      - "5432:5432"
+      - "15432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U consistency"]
       interval: 5s
       timeout: 3s
+      retries: 20
+
+  # Kafka в KRaft-режиме (без Zookeeper). Официальный apache/kafka образ.
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: consistency-kafka
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: controller,broker
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    ports:
+      - "19092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
       retries: 20
 
   consistency-service:
@@ -75,11 +126,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      kafka:
+        condition: service_healthy
       ignite-1:
-        condition: service_started
-      ignite-2:
-        condition: service_started
-      ignite-3:
         condition: service_started
     environment:
       PG_URL: jdbc:postgresql://postgres:5432/consistency
@@ -87,10 +136,9 @@ services:
       PG_PASSWORD: consistency
       CLUSTER1_HOST: ignite-1
       CLUSTER1_PORT: "10800"
-      CLUSTER2_HOST: ignite-2
-      CLUSTER2_PORT: "10800"
-      CLUSTER3_HOST: ignite-3
-      CLUSTER3_PORT: "10800"
       CONSISTENCY_DEBUG_EXPLAIN: "true"
+      # Kafka publishing — listener-based fan-out доменных событий.
+      CONSISTENCY_KAFKA_ENABLED: "true"
+      KAFKA_BOOTSTRAP: kafka:9092
     ports:
-      - "8080:8080"
+      - "18080:8080"

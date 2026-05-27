@@ -2,20 +2,33 @@
 <!--
   DataSpace модель для stmnt-consistency-service.
 
-  Соответствует Flyway-миграциям V1/V2/V3 (PostgreSQL JdbcTemplate реализация
-  сейчас активна). После подключения настоящего DataSpace + dataspace-bom:
+  Соответствует Flyway-миграциям V1/V2/V3/V4 (PostgreSQL JdbcTemplate
+  реализация сейчас активна). После подключения настоящего DataSpace +
+  dataspace-bom:
     1. Поднять generator: dataspace создаст entity/repo классы из этого XML
     2. Реализовать DataSpace*Repository в lib/repo/dataspace/ под уже
        существующие интерфейсы ConsistencyRunRepository / HashRepository /
-       MismatchRepository / ErrorRepository
+       MismatchRepository / ErrorRepository / HashLatestRepository
     3. Переключить @ConditionalOnProperty(consistency.repo=dataspace) — JDBC
        impl выключится, DataSpace встанет на его место. Контракты не меняются.
+
+  Маппинг Flyway-миграций на DataSpace-классы:
+    V1 → ConsistencyRun, ConsistencyHash (история pull-mode прогонов)
+    V2 → ConsistencyMismatch (выявленные расхождения)
+    V3 → ConsistencyError (единый error registry)
+    V4 → ConsistencyHashLatest (CDC mirror для push-mode)
 
   В этой модели НЕТ JSONB полей (DataSpace их нативно не поддерживает; в
   Flyway-схеме они были у consistency_mismatch.hashes_json и
   consistency_error.details_json). Заменены на String с большим length —
   Jackson сериализует туда мапу как plain JSON-текст. При чтении на стороне
   DataSpace-репо парсим обратно через ObjectMapper.
+
+  Partial indexes (PostgreSQL `WHERE` clause после CREATE INDEX) тоже не
+  поддерживаются DataSpace напрямую — где они были в Flyway (idx_err_unresolved
+  WHERE resolved_at IS NULL, idx_hash_latest_op_updated WHERE op='REMOVED'),
+  они становятся обычными composite-индексами без фильтра. Это даёт небольшое
+  raise в стоимости retention-jobs, но не меняет семантику запросов.
 -->
 <model model-name="consistency"
        version="DEV-SNAPSHOT"
@@ -155,6 +168,60 @@
         <index unique="false">
             <property name="level"/>
             <property name="occurredAt"/>
+        </index>
+    </class>
+
+    <!--
+      CDC-зеркало: одна строка на (cluster, cache, businessKey) — последний
+      известный hash из CDC-потока. Соответствует consistency_hash_latest (V4).
+
+      В отличие от ConsistencyHash (append-only история pull-mode прогонов),
+      эта таблица — eventually-consistent проекция CDC-событий из Kafka.
+      UPSERT на каждый event PUT/REMOVED от KafkaCdcPublisherBean.
+
+      Sweep-job (ConsistencySweepJob) делает GROUP BY (cacheName, businessKey)
+      → если COUNT(DISTINCT hash) > 1 — фиксирует в ConsistencyMismatch.
+
+      Композитный естественный ключ (clusterId, cacheName, businessKey) —
+      в DataSpace отмечен как unique index, поверх auto-generated objectId.
+    -->
+    <class name="ConsistencyHashLatest"
+           label="consistency_hash_latest. CDC-mirror текущего состояния кешей">
+        <property name="clusterId"   type="String" length="64" mandatory="true"
+                  label="Логический идентификатор кластера (cluster-1 | cluster-2 | ...)"/>
+        <property name="cacheName"   type="String" length="64" mandatory="true"
+                  label="Имя кеша Ignite (REGISTER | TURN_DOC_CUR | DAY_BALANCES | ...)"/>
+        <property name="businessKey" type="String" length="256" mandatory="true"
+                  label="Бизнес-ключ записи, детерминированный hash-функцией кеша"/>
+        <property name="hash"        type="String" length="64" mandatory="true"
+                  label="MD5 hex (32 символа) канонического представления полей. Для op=REMOVED — пустой/последний"/>
+        <property name="op"          type="String" length="16" mandatory="true"
+                  label="Тип события: PUT | REMOVED"/>
+        <property name="eventTs"     type="LocalDateTime" mandatory="true"
+                  label="Момент события на стороне Ignite (timestamp с listener'а)"/>
+        <property name="updatedAt"   type="LocalDateTime" mandatory="true"
+                  label="Момент записи в DataSpace (нашей стороны). updated_at &gt; event_ts = lag"/>
+
+        <!-- Natural composite key (для UPSERT-семантики). DataSpace storage
+             всё равно generate'нет внутренний objectId. -->
+        <index unique="true">
+            <property name="clusterId"/>
+            <property name="cacheName"/>
+            <property name="businessKey"/>
+        </index>
+
+        <!-- Sweep идёт GROUP BY (cacheName, businessKey) — индекс покрывает HAVING. -->
+        <index unique="false">
+            <property name="cacheName"/>
+            <property name="businessKey"/>
+        </index>
+
+        <!-- Retention-job чистит REMOVED-tombstones по op + updatedAt.
+             В Flyway-варианте здесь был partial index `WHERE op='REMOVED'` —
+             DataSpace partial не поддерживает, делаем обычный composite. -->
+        <index unique="false">
+            <property name="op"/>
+            <property name="updatedAt"/>
         </index>
     </class>
 

@@ -15,6 +15,13 @@ spring:
     enabled: true
     locations: classpath:db/migration
     baseline-on-migrate: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:kafka:9092}
+    producer:
+      key-serializer:   org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        spring.json.add.type.headers: false       # internal events, без type info
 
 management:
   endpoints:
@@ -31,18 +38,30 @@ logging:
     ru.sbrf.pprb.stmnt.consistency: INFO
 
 consistency:
-  cron: "0 5 * * * *"      # every hour at :05
+  cron: "0 5 * * * *"      # every hour at :05  (только pull-mode)
   snapshot-lag: PT5M       # 5 min
   turn-lookback-days: 3
   hash-retention-days: 30
   debug-explain-plans: ${CONSISTENCY_DEBUG_EXPLAIN:false}
+  # Legacy pull-режим через thin-client SQL. По default — выключен.
+  # Используется как fallback / bootstrap-инструмент / ручной replay.
+  pull-mode: ${CONSISTENCY_PULL_MODE:false}
+  # Основной канал: CDC из Kafka → UPSERT в consistency_hash_latest → sweep.
+  cdc:
+    enabled: ${CONSISTENCY_CDC_ENABLED:true}
+    group-id: ${CONSISTENCY_CDC_GROUP:consistency-cdc}
+    sweep-cron: "${CONSISTENCY_CDC_SWEEP_CRON:0 */5 * * * *}"
+    max-poll-records: ${CONSISTENCY_CDC_MAX_POLL:500}
+  events:
+    # Когда true — KafkaEventListener шлёт доменные события (mismatch.detected,
+    # run.finished, …) НАРУЖУ. Это OUTBOUND поток для внешних потребителей;
+    # отдельно от CDC (CDC — это INBOUND поток от Ignite в hash_latest).
+    kafka-enabled: ${CONSISTENCY_KAFKA_ENABLED:false}
+    topic-prefix: ${CONSISTENCY_KAFKA_TOPIC_PREFIX:stmnt-consistency}
   clusters:
     - id: cluster-1
+      # Все 3 узла одного кластера — thin-client failover через них
       addresses:
         - ${CLUSTER1_HOST:ignite-1}:${CLUSTER1_PORT:10800}
-    - id: cluster-2
-      addresses:
-        - ${CLUSTER2_HOST:ignite-2}:${CLUSTER2_PORT:10800}
-    - id: cluster-3
-      addresses:
-        - ${CLUSTER3_HOST:ignite-3}:${CLUSTER3_PORT:10800}
+        - ignite-1b:10800
+        - ignite-1c:10800

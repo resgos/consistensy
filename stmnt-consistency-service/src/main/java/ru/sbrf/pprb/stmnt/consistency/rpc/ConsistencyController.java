@@ -3,8 +3,12 @@ package ru.sbrf.pprb.stmnt.consistency.rpc;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.beans.factory.ObjectProvider;
 import ru.sbrf.pprb.stmnt.consistency.api.dto.*;
 import ru.sbrf.pprb.stmnt.consistency.lib.ConsistencyJob;
+import ru.sbrf.pprb.stmnt.consistency.lib.cdc.ConsistencySweepJob;
+import ru.sbrf.pprb.stmnt.consistency.lib.events.DomainEvents;
+import ru.sbrf.pprb.stmnt.consistency.lib.events.EventPublisher;
 import ru.sbrf.pprb.stmnt.consistency.lib.repo.ConsistencyRunRepository;
 import ru.sbrf.pprb.stmnt.consistency.lib.repo.MismatchRepository;
 
@@ -17,14 +21,29 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class ConsistencyController {
 
-    private final ConsistencyJob job;
+    // Один из двух может быть в контексте — либо pull-mode (ConsistencyJob), либо
+    // cdc-mode (ConsistencySweepJob). Контроллер вызывает того, кто есть.
+    private final ObjectProvider<ConsistencyJob> pullJob;
+    private final ObjectProvider<ConsistencySweepJob> sweepJob;
     private final ConsistencyRunRepository runRepo;
     private final MismatchRepository mismatchRepo;
+    private final EventPublisher events;
 
     @PostMapping("/run")
     public RunResponseDto run(@RequestBody(required = false) RunRequestDto body) {
         String cacheName = body != null ? body.cacheName() : null;
-        long id = job.runAll(cacheName);
+        long id;
+        ConsistencyJob pull = pullJob.getIfAvailable();
+        if (pull != null) {
+            id = pull.runAll(cacheName);
+        } else {
+            ConsistencySweepJob sweep = sweepJob.getIfAvailable();
+            if (sweep == null) {
+                throw new IllegalStateException(
+                        "Neither pull-mode (ConsistencyJob) nor cdc-mode (ConsistencySweepJob) is enabled");
+            }
+            id = sweep.sweepOnce(cacheName);
+        }
         var run = runRepo.findById(id);
         return new RunResponseDto(id, run.map(ConsistencyRunDto::status).orElse("UNKNOWN"));
     }
@@ -55,6 +74,10 @@ public class ConsistencyController {
     public Map<String, Object> resolve(@PathVariable long id,
                                         @RequestBody(required = false) Map<String, String> body) {
         String notes = body != null ? body.get("notes") : null;
-        return Map.of("updated", mismatchRepo.resolve(id, notes));
+        int updated = mismatchRepo.resolve(id, notes);
+        if (updated > 0) {
+            events.publish(new DomainEvents.MismatchResolved(id, notes, Instant.now()));
+        }
+        return Map.of("updated", updated);
     }
 }

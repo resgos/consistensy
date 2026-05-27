@@ -9,10 +9,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-import static ru.sbrf.pprb.stmnt.consistency.lib.hash.HashUtil.asBigDecimal;
-import static ru.sbrf.pprb.stmnt.consistency.lib.hash.HashUtil.asEpochMillis;
-import static ru.sbrf.pprb.stmnt.consistency.lib.hash.HashUtil.asString;
-import static ru.sbrf.pprb.stmnt.consistency.lib.hash.HashUtil.md5Of;
+import static ru.sbrf.pprb.stmnt.consistency.hashers.HashUtil.asBigDecimal;
+import static ru.sbrf.pprb.stmnt.consistency.hashers.HashUtil.asEpochMillis;
+import static ru.sbrf.pprb.stmnt.consistency.hashers.HashUtil.asString;
+import static ru.sbrf.pprb.stmnt.consistency.hashers.HashUtil.md5Of;
 
 /**
  * Per-cache hashers. Field order matches the spec exactly; do not reorder

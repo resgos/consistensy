@@ -17,6 +17,8 @@
     <packaging>pom</packaging>
 
     <modules>
+        <module>stmnt-consistency-hashers</module>
+        <module>stmnt-consistency-ignite-cdc</module>
         <module>stmnt-consistency-service</module>
     </modules>
 
