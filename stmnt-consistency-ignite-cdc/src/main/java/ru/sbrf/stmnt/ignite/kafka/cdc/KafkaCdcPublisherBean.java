@@ -67,7 +67,18 @@ public class KafkaCdcPublisherBean implements LifecycleBean {
     // ---- configuration -----------------------------------------------------
     private String bootstrapServers;
     private String clusterId;
-    private String topicPrefix = "stmnt-consistency";
+    /**
+     * Имя единственного Kafka topic'а для всех CDC events со всех Ignite кешей
+     * и кластеров. Раньше было per-cluster ({prefix}.cdc.{clusterId}.hashes) —
+     * но это создавало N топиков на N кластеров × multiplying overhead для DBA.
+     *
+     * Теперь один topic. clusterId передаётся в payload (CdcEvent.clusterId),
+     * consumer фильтрует по нему когда надо (например для OffsetController).
+     */
+    private String topic = "stmnt-consistency-cdc";
+    /** @deprecated используй setTopic — оставлен для backward compat. */
+    @Deprecated
+    private String topicPrefix;
     private Map<String, CdcEventHasher> hashers = new HashMap<>();
     private boolean enabled = true;
 
@@ -168,7 +179,8 @@ public class KafkaCdcPublisherBean implements LifecycleBean {
             String hash = (op == CdcEvent.Op.REMOVED || value == null)
                     ? ""
                     : hasher.hashOf(key, value);
-            String topic = topicPrefix + ".cdc." + clusterId + ".hashes";
+            // Один topic для всех CDC событий. clusterId уже в payload
+            // (CdcEvent.clusterId) — consumer фильтрует по нему при необходимости.
             CdcEvent payload = new CdcEvent(clusterId, logical, bk, hash, op,
                     System.currentTimeMillis());
             String json = mapper.writeValueAsString(payload);
@@ -176,6 +188,8 @@ public class KafkaCdcPublisherBean implements LifecycleBean {
                 log.fine("CDC send topic=" + topic + " key=" + payload.partitionKey()
                         + " op=" + op);
             }
+            // partitionKey = clusterId + ":" + businessKey — гарантирует
+            // упорядоченность в рамках одного register/cluster.
             producer.send(new ProducerRecord<>(topic, payload.partitionKey(), json),
                     (md, ex) -> {
                         if (ex != null) {
@@ -228,7 +242,10 @@ public class KafkaCdcPublisherBean implements LifecycleBean {
     // ---- setters -----------------------------------------------------------
     public void setBootstrapServers(String v) { this.bootstrapServers = v; }
     public void setClusterId(String v)        { this.clusterId = v; }
-    public void setTopicPrefix(String v)      { this.topicPrefix = v; }
+    public void setTopic(String v)            { this.topic = v; }
+    /** @deprecated используй setTopic — старая per-cluster схема. Сохранён для backward compat. */
+    @Deprecated
+    public void setTopicPrefix(String v)      { this.topicPrefix = v; /* ignored */ }
     public void setHashers(Map<String, CdcEventHasher> v) { this.hashers = v; }
     public void setEnabled(boolean v)         { this.enabled = v; }
 }
