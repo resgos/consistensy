@@ -41,14 +41,9 @@ public final class IgniteCdcHashers {
     // ---- helpers ----------------------------------------------------------
 
     private static Object f(Object value, String field) {
+        if (value == null) return null;
         if (value instanceof BinaryObject) return ((BinaryObject) value).field(field);
-        // fallback на reflection — на случай если cache не в keepBinary режиме
-        try {
-            String getter = "get" + Character.toUpperCase(field.charAt(0)) + field.substring(1);
-            return value.getClass().getMethod(getter).invoke(value);
-        } catch (Exception e) {
-            return null;
-        }
+        return reflectGet(value, field);
     }
 
     private static String fs(Object v, String field) {
@@ -56,10 +51,43 @@ public final class IgniteCdcHashers {
     }
 
     private static Object keyField(Object key, String field) {
+        if (key == null) return null;
         if (key instanceof BinaryObject) return ((BinaryObject) key).field(field);
+        return reflectGet(key, field);
+    }
+
+    /**
+     * Reflection-based getter с поддержкой обеих conventions:
+     *   1. Lombok @Getter (standard JavaBeans): getObjectId(), getRegister()
+     *   2. Lombok @Accessors(fluent = true):   objectId(),    register()
+     *
+     * Используется TurnDocCurAffinityKey и DayBalancesAffinityKey — у них
+     * fluent accessors (без get-префикса). Старая логика возвращала null →
+     * businessKey становился "null:null" → cross-cluster comparison ломался.
+     */
+    private static Object reflectGet(Object obj, String field) {
+        if (obj == null || field == null || field.isEmpty()) return null;
+        Class<?> cls = obj.getClass();
+        // 1) Lombok @Getter — getFooBar()
         try {
             String getter = "get" + Character.toUpperCase(field.charAt(0)) + field.substring(1);
-            return key.getClass().getMethod(getter).invoke(key);
+            return cls.getMethod(getter).invoke(obj);
+        } catch (NoSuchMethodException ignore) {
+            // fall through
+        } catch (Exception e) {
+            return null;
+        }
+        // 2) Lombok @Accessors(fluent=true) — fooBar()
+        try {
+            return cls.getMethod(field).invoke(obj);
+        } catch (NoSuchMethodException ignore) {
+            // fall through
+        } catch (Exception e) {
+            return null;
+        }
+        // 3) Direct field access (если public field — теоретически не должно быть)
+        try {
+            return cls.getField(field).get(obj);
         } catch (Exception e) {
             return null;
         }
