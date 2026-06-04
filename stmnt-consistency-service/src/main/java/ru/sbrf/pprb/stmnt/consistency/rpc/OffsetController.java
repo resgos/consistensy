@@ -25,11 +25,17 @@ import java.util.concurrent.TimeUnit;
  * Управление CDC consumer offset'ами.
  *
  *   POST /api/consistency/offsets/seek
- *        ?topic=stmnt-consistency.cdc.cluster-2.hashes
+ *        ?topic=stmnt-consistency-cdc
  *        &partition=0
  *        &offset=12345                  (literal offset)
  *        — or —
  *        &reset=earliest|latest         (well-known positions)
+ *
+ * <p>Раньше topic был per-cluster ({@code stmnt-consistency.cdc.cluster-N.hashes}) —
+ * можно было двигать offset одного кластера независимо. Теперь один topic для
+ * всех CDC events, поэтому seek двигает offset всего CDC потока сразу.
+ * Если нужен per-cluster replay — фильтровать по {@code clusterId} в payload
+ * на стороне consumer'а (отдельная фича, не offset seek).
  *
  * Алгоритм:
  *   1. stop() container — KafkaConsumer выходит из group, оставляет partition

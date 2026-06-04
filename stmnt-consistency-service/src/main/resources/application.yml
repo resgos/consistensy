@@ -49,6 +49,11 @@ consistency:
   # Основной канал: CDC из Kafka → UPSERT в consistency_hash_latest → sweep.
   cdc:
     enabled: ${CONSISTENCY_CDC_ENABLED:true}
+    # ОДИН topic для всех CDC events со всех Ignite кешей и кластеров.
+    # clusterId передаётся в payload (CdcEvent.clusterId) — раньше был
+    # per-cluster topic, теперь упрощено.
+    # Должно совпадать с consistency.cdc.topic на стороне Ignite (publisher).
+    topic: ${CONSISTENCY_CDC_TOPIC:stmnt-consistency-cdc}
     group-id: ${CONSISTENCY_CDC_GROUP:consistency-cdc}
     sweep-cron: "${CONSISTENCY_CDC_SWEEP_CRON:0 */5 * * * *}"
     max-poll-records: ${CONSISTENCY_CDC_MAX_POLL:500}

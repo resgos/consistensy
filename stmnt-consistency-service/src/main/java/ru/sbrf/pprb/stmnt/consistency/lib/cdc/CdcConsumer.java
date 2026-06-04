@@ -11,28 +11,42 @@ import ru.sbrf.pprb.stmnt.consistency.lib.ErrorRegistry;
 import ru.sbrf.pprb.stmnt.consistency.lib.repo.HashLatestRepository;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Подписан на CDC-топики Ignite-кластеров.
+ * CDC consumer — подписан на ОДИН Kafka topic для всех CDC events
+ * со всех Ignite кешей и кластеров.
  *
- * Топики устроены ОДИН-НА-КЛАСТЕР:
- *   stmnt-consistency.cdc.cluster-1.hashes
- *   stmnt-consistency.cdc.cluster-2.hashes
- *   stmnt-consistency.cdc.cluster-3.hashes
+ * <h3>Архитектура</h3>
+ * Producer: {@code KafkaCdcPublisherBean} (на каждой Ignite-ноде) публикует
+ * в {@code stmnt-consistency-cdc} (имя настраивается через
+ * {@code consistency.cdc.topic}).
+ * Payload: {@link CdcEvent} с полем {@code clusterId} — consumer определяет
+ * источник по нему (НЕ по topic name, как было раньше с per-cluster схемой).
  *
- * Это позволяет двигать offset для одного кластера независимо от других
- * (через OffsetController.seek). consumer-group ОБЩАЯ — один процесс читает
- * все три топика.
+ * <h3>Раньше</h3>
+ * Было N топиков {@code stmnt-consistency.cdc.cluster-N.hashes} (по одному
+ * на кластер), consumer подписывался через {@code topicPattern}. Это требовало
+ * создавать новый topic при добавлении кластера + DBA overhead.
  *
- * Поведение:
- *   - poll-batch UPSERT'ится в consistency_hash_latest.
- *   - clusterId в самом payload (CdcEvent.clusterId) — мы доверяем продьюсеру.
- *     Топик нужен только для управления offset'ами по кластеру.
+ * <h3>Сейчас</h3>
+ * Один topic для всех. {@code clusterId} в payload — consumer группирует
+ * по нему когда нужно (например для retention policies или alerting per-cluster).
  *
- * @ConditionalOnProperty: включается только когда consistency.cdc.enabled=true.
- * При false consistency-service работает только в pull-mode (старый ConsistencyJob).
+ * <h3>Поведение</h3>
+ * <ul>
+ *   <li>poll-batch UPSERT'ится в {@code consistency_hash_latest}.</li>
+ *   <li>{@code (cacheName, businessKey)} → последний hash для каждой записи
+ *       — sweep job находит расхождения через GROUP BY на этой таблице.</li>
+ *   <li>Партиционирование в Kafka по {@code clusterId:businessKey} —
+ *       упорядоченность в рамках одной (cluster, register) пары сохраняется.</li>
+ * </ul>
+ *
+ * <p>{@code @ConditionalOnProperty}: включается только когда
+ * {@code consistency.cdc.enabled=true}. При false consistency-service работает
+ * только в pull-mode (старый {@code ConsistencyJob}).
  */
 @Slf4j
 @Component
@@ -43,17 +57,15 @@ public class CdcConsumer {
     private final HashLatestRepository hashLatest;
     private final ErrorRegistry errors;
 
-    /**
-     * Одна annotation, три топика — Spring создаст по одному
-     * KafkaMessageListenerContainer на каждый. id'ы фиксируем, чтобы
-     * OffsetController мог найти контейнер по cluster-id.
-     */
+    /** Listener ID — для {@code OffsetController} (найти container по имени). */
     public static final String LISTENER_ID = "cdc-consumer";
 
     @KafkaListener(
             id = LISTENER_ID,
             idIsGroup = false,
-            topicPattern = "${consistency.events.topic-prefix:stmnt-consistency}\\.cdc\\.cluster-.+\\.hashes",
+            // Один topic. Property consistency.cdc.topic — синхронизирован с
+            // KafkaCdcPublisherBean.topic на стороне Ignite.
+            topics = "${consistency.cdc.topic:stmnt-consistency-cdc}",
             groupId = "${consistency.cdc.group-id:consistency-cdc}",
             containerFactory = "cdcKafkaListenerContainerFactory",
             batch = "true"
@@ -62,6 +74,8 @@ public class CdcConsumer {
         if (records.isEmpty()) return;
         List<CdcEvent> events = new ArrayList<>(records.size());
         String firstTopic = records.get(0).topic();
+        // Кол-во events по clusterId — для observability и log'ов.
+        Map<String, Integer> perCluster = new HashMap<>();
         for (ConsumerRecord<String, CdcEvent> r : records) {
             CdcEvent e = r.value();
             if (e == null) {
@@ -70,20 +84,27 @@ public class CdcConsumer {
                 continue;
             }
             events.add(e);
+            // clusterId из payload — НЕ из topic name (топик теперь один).
+            perCluster.merge(
+                    e.clusterId() != null ? e.clusterId() : "UNKNOWN",
+                    1, Integer::sum);
         }
         try {
             hashLatest.upsertBatch(events);
-            log.debug("CDC: upserted {} events topic={} first.offset={} last.offset={}",
-                    events.size(), firstTopic,
-                    records.get(0).offset(),
-                    records.get(records.size() - 1).offset());
+            if (log.isDebugEnabled()) {
+                log.debug("CDC: upserted {} events topic={} byCluster={} first.offset={} last.offset={}",
+                        events.size(), firstTopic, perCluster,
+                        records.get(0).offset(),
+                        records.get(records.size() - 1).offset());
+            }
         } catch (Exception ex) {
-            // Не глотаем — Spring Kafka не закоммитит offset, передёрнем batch.
-            log.error("CDC: upsert batch failed topic={} size={}: {}",
-                    firstTopic, events.size(), ex.toString(), ex);
+            // Не глотаем — Spring Kafka не закоммитит offset, передёрнет batch.
+            log.error("CDC: upsert batch failed topic={} size={} byCluster={}: {}",
+                    firstTopic, events.size(), perCluster, ex.toString(), ex);
             errors.error("cdc_consumer", "UPSERT_FAILED",
                     "CDC batch upsert failed", ex,
-                    Map.of("topic", firstTopic, "batchSize", events.size()));
+                    Map.of("topic", firstTopic, "batchSize", events.size(),
+                            "byCluster", perCluster));
             throw ex;
         }
     }
